@@ -1,6 +1,5 @@
 import cv2
 import numpy as np
-import threading
 
 class DetectorObj:
     def __init__(self):
@@ -8,8 +7,14 @@ class DetectorObj:
 
     def detect_objects(self, frame):
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        mask = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV, 19, 5)
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        mask = cv2.adaptiveThreshold(
+            gray, 255,
+            cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV,
+            19, 5
+        )
+        contours, _ = cv2.findContours(
+            mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
 
         objects_contours = []
         for cnt in contours:
@@ -19,25 +24,23 @@ class DetectorObj:
 
         return objects_contours
 
-parameters = cv2.aruco.DetectorParameters_create()
-aruco_dict = cv2.aruco.Dictionary_get(cv2.aruco.DICT_5X5_50)
+parameters = cv2.aruco.DetectorParameters()
+aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_5X5_50)
+aruco_detector = cv2.aruco.ArucoDetector(aruco_dict, parameters)
 
 pixel_cm_ratio = None
-lock = threading.Lock()
 
 def process_frame(frame):
     global pixel_cm_ratio
     img = frame.copy()
 
-    corners, _, _ = cv2.aruco.detectMarkers(img, aruco_dict, parameters=parameters)
+    corners, ids, _ = aruco_detector.detectMarkers(img)
     if corners:
-        int_corners = np.int0(corners)
+        int_corners = np.intp(corners)
         cv2.polylines(img, int_corners, True, (0, 255, 0), 5)
 
         aruco_perimeter = cv2.arcLength(corners[0], True)
-
-        with lock:
-            pixel_cm_ratio = aruco_perimeter / 20
+        pixel_cm_ratio = aruco_perimeter / 20
 
         detector = DetectorObj()
         contours = detector.detect_objects(img)
@@ -50,34 +53,36 @@ def process_frame(frame):
             object_height = h / pixel_cm_ratio
 
             box = cv2.boxPoints(rect)
-            box = np.int0(box)
+            box = np.intp(box)
 
             cv2.circle(img, (int(x), int(y)), 5, (0, 0, 255), -1)
             cv2.polylines(img, [box], True, (255, 0, 0), 2)
-            cv2.putText(img, "Width {} cm".format(round(object_width, 1)), (int(x - 100), int(y - 20)),
-                        cv2.FONT_HERSHEY_PLAIN, 2, (100, 200, 0), 2)
-            cv2.putText(img, "Height {} cm".format(round(object_height, 1)), (int(x - 100), int(y + 15)),
-                        cv2.FONT_HERSHEY_PLAIN, 2, (100, 200, 0), 2)
+            cv2.putText(
+                img, f"Width {round(object_width, 1)} cm",
+                (int(x - 100), int(y - 20)),
+                cv2.FONT_HERSHEY_PLAIN, 2, (100, 200, 0), 2
+            )
+            cv2.putText(
+                img, f"Height {round(object_height, 1)} cm",
+                (int(x - 100), int(y + 15)),
+                cv2.FONT_HERSHEY_PLAIN, 2, (100, 200, 0), 2
+            )
 
     cv2.imshow("Image", img)
 
-def read_camera(cap):
+def main():
+    cap = cv2.VideoCapture(0)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
     while True:
         ret, frame = cap.read()
         if not ret:
             break
         process_frame(frame)
-        if cv2.waitKey(1) == 27:
+        if cv2.waitKey(1) == 27:  # Esc to exit
             break
-
-def main():
-    cap = cv2.VideoCapture(1)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-
-    threading.Thread(target=read_camera, args=(cap,), daemon=True).start()
-    cv2.destroyAllWindows()
     cap.release()
+    cv2.destroyAllWindows()
 
 if __name__ == "__main__":
     main()
