@@ -1,0 +1,342 @@
+import cv2
+import numpy as np
+import math
+import time
+import RPi.GPIO as GPIO
+
+# =========================
+# GPIO setup & durations
+# =========================
+# Servos (simple ON/OFF gating per ranges)
+SERVO_PINS = [5, 6, 12, 13]
+
+# Button / Relays / LED
+BUTTON_PIN = 17              # Input (active LOW with pull-up)
+RELAY_A_PIN = 18             # ON for a duration on button press
+LED_PIN = 27                 # Mirrors Relay A timer
+RELAY_B_PIN = 22             # ON for a duration on button press OR detection
+
+# ---- Customizable durations (seconds) ----
+BUTTON_ON_DURATION_18 = 1.0   # Relay A (and LED) ON duration after a button press
+BUTTON_ON_DURATION_22 = 1.0   # Relay B ON duration after a button press
+DETECT_ON_DURATION_22 = 2.0   # Relay B ON duration after each length detection
+# ------------------------------------------
+
+# Button debounce
+BUTTON_DEBOUNCE_SEC = 0.05
+
+GPIO.setmode(GPIO.BCM)
+
+# Servos as simple outputs (HIGH/LOW gating)
+for pin in SERVO_PINS:
+    GPIO.setup(pin, GPIO.OUT)
+    GPIO.output(pin, GPIO.LOW)
+
+# IOs
+GPIO.setup(BUTTON_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)  # Button with internal pull-up
+GPIO.setup(RELAY_A_PIN, GPIO.OUT, initial=GPIO.LOW)
+GPIO.setup(LED_PIN, GPIO.OUT, initial=GPIO.LOW)
+GPIO.setup(RELAY_B_PIN, GPIO.OUT, initial=GPIO.LOW)
+
+# Button state for edge detection (debounced)
+_last_raw_button_state = GPIO.input(BUTTON_PIN)
+_last_stable_button_state = _last_raw_button_state
+_last_state_change_t = time.monotonic()
+
+# Timers (expiry timestamps, monotonic seconds)
+_relay_a_expiry_t = 0.0                 # Relay A (and LED) timer from button
+_relay_b_button_expiry_t = 0.0          # Relay B timer from button
+_relay_b_detect_expiry_t = 0.0          # Relay B timer from detection
+
+
+def _now():
+    return time.monotonic()
+
+
+def _start_or_extend(expiry_ref_name, duration):
+    """
+    Extend a named expiry timer to at least now + duration.
+    """
+    global _relay_a_expiry_t, _relay_b_button_expiry_t, _relay_b_detect_expiry_t
+    now = _now()
+    if expiry_ref_name == "A":
+        _relay_a_expiry_t = max(_relay_a_expiry_t, now + duration)
+    elif expiry_ref_name == "B_BUTTON":
+        _relay_b_button_expiry_t = max(_relay_b_button_expiry_t, now + duration)
+    elif expiry_ref_name == "B_DETECT":
+        _relay_b_detect_expiry_t = max(_relay_b_detect_expiry_t, now + duration)
+
+
+def _apply_output_levels():
+    """
+    Drive GPIOs according to current timers.
+    - Relay A (and LED) ON while now < _relay_a_expiry_t
+    - Relay B ON while now < max(_relay_b_button_expiry_t, _relay_b_detect_expiry_t)
+    """
+    now = _now()
+    a_on = now < _relay_a_expiry_t
+    b_on = now < max(_relay_b_button_expiry_t, _relay_b_detect_expiry_t)
+
+    GPIO.output(RELAY_A_PIN, GPIO.HIGH if a_on else GPIO.LOW)
+    GPIO.output(LED_PIN,     GPIO.HIGH if a_on else GPIO.LOW)
+    GPIO.output(RELAY_B_PIN, GPIO.HIGH if b_on else GPIO.LOW)
+
+
+def poll_button_and_handle_edge():
+    """
+    Debounce the button and fire timers on the **press edge** (HIGH->LOW).
+    """
+    global _last_raw_button_state, _last_stable_button_state, _last_state_change_t
+
+    now = _now()
+    raw = GPIO.input(BUTTON_PIN)  # HIGH = idle, LOW = pressed
+
+    if raw != _last_raw_button_state:
+        _last_raw_button_state = raw
+        _last_state_change_t = now
+
+    # If stable for debounce window, accept as the new stable state
+    if now - _last_state_change_t >= BUTTON_DEBOUNCE_SEC:
+        if raw != _last_stable_button_state:
+            # Edge detected
+            prev = _last_stable_button_state
+            _last_stable_button_state = raw
+
+            # Press edge: HIGH -> LOW
+            if prev == GPIO.HIGH and raw == GPIO.LOW:
+                # Start/extend timers for button action
+                _start_or_extend("A", BUTTON_ON_DURATION_18)      # Relay A + LED
+                _start_or_extend("B_BUTTON", BUTTON_ON_DURATION_22)  # Relay B (button-caused)
+
+
+def pulse_relay_b_for_detection():
+    """
+    Called whenever a valid length is measured.
+    Extends Relay B ON time for DETECT_ON_DURATION_22.
+    """
+    _start_or_extend("B_DETECT", DETECT_ON_DURATION_22)
+
+
+# =========================
+# Vision setup (same as before)
+# =========================
+BLUR_KSIZE = (5, 5)
+MORPH_KSIZE = (3, 3)
+OPEN_ITER = 1
+CLOSE_ITER = 1
+ADAPTIVE_BLOCK_SIZE = 19
+ADAPTIVE_C = 5
+AREA_MIN = 2000
+
+EMA_ALPHA = 0.3
+MAX_MATCH_DIST = 60.0
+TRACK_TTL = 15
+
+DOWNSCALE_FACTOR = 0.5
+USE_ROI = True
+ROI_RECT = (0, 400, 1280, 520)  # <--- Your ROI (x, y, w, h) FULL-RES
+
+class DetectorObj:
+    def __init__(self):
+        self.kernel = cv2.getStructuringElement(cv2.MORPH_RECT, MORPH_KSIZE)
+
+    def detect_objects(self, frame_small, area_min_small):
+        gray = cv2.cvtColor(frame_small, cv2.COLOR_BGR2GRAY)
+        gray_blur = cv2.GaussianBlur(gray, BLUR_KSIZE, 0)
+        mask = cv2.adaptiveThreshold(
+            gray_blur, 255,
+            cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV,
+            ADAPTIVE_BLOCK_SIZE, ADAPTIVE_C
+        )
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, self.kernel, iterations=OPEN_ITER)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self.kernel, iterations=CLOSE_ITER)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        return [cnt for cnt in contours if cv2.contourArea(cnt) > area_min_small]
+
+class EmaSmoother:
+    def __init__(self, alpha=EMA_ALPHA, max_match_dist=MAX_MATCH_DIST, ttl=TRACK_TTL):
+        self.alpha = float(alpha)
+        self.max_match_dist = float(max_match_dist)
+        self.ttl = int(ttl)
+        self.tracks = {}
+        self.next_id = 1
+
+    def _dist(self, p, q):
+        return math.hypot(p[0] - q[0], p[1] - q[1])
+
+    def _create_track(self, x, y, w, h):
+        tid = self.next_id; self.next_id += 1
+        self.tracks[tid] = {"x": float(x), "y": float(y), "w": float(w), "h": float(h), "last_seen": 0}
+        return tid
+
+    def update(self, rects_full):
+        for tr in self.tracks.values():
+            tr["last_seen"] += 1
+        unmatched = set(self.tracks.keys())
+        results = []
+        for (x, y, w, h, angle) in rects_full:
+            best_tid, best_d = None, float("inf")
+            for tid in unmatched:
+                tr = self.tracks[tid]
+                d = self._dist((x, y), (tr["x"], tr["y"]))
+                if d < best_d and d <= self.max_match_dist:
+                    best_tid, best_d = tid, d
+            if best_tid is None:
+                tid = self._create_track(x, y, w, h)
+                x_s, y_s, w_s, h_s = x, y, w, h
+            else:
+                tr = self.tracks[best_tid]
+                a = self.alpha
+                x_s = a * x + (1 - a) * tr["x"]
+                y_s = a * y + (1 - a) * tr["y"]
+                w_s = a * w + (1 - a) * tr["w"]
+                h_s = a * h + (1 - a) * tr["h"]
+                tr.update({"x": x_s, "y": y_s, "w": w_s, "h": h_s, "last_seen": 0})
+                tid = best_tid; unmatched.remove(best_tid)
+            results.append({"id": tid, "x": x_s, "y": y_s, "w": w_s, "h": h_s, "angle": angle})
+        # cleanup stale
+        for tid in list(self.tracks.keys()):
+            if self.tracks[tid]["last_seen"] > self.ttl:
+                del self.tracks[tid]
+        return results
+
+# ---- ArUco detector setup ----
+parameters = cv2.aruco.DetectorParameters()
+aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_5X5_50)
+aruco_detector = cv2.aruco.ArucoDetector(aruco_dict, parameters)
+
+pixel_cm_ratio = None
+detector = DetectorObj()
+smoother = EmaSmoother()
+
+# =========================
+# Servo control ranges
+# =========================
+def control_servos(length_cm):
+    """
+    Activates exactly one servo pin depending on the measured length.
+    Also triggers Relay B's detection timer.
+    """
+    # Reset first
+    for pin in SERVO_PINS:
+        GPIO.output(pin, GPIO.LOW)
+
+    # Apply ranges
+    if 8.7 <= length_cm <= 10.0:
+        GPIO.output(5, GPIO.HIGH)
+    elif 10.0 < length_cm <= 11.4:
+        GPIO.output(6, GPIO.HIGH)
+    elif 11.6 <= length_cm <= 14.3:
+        GPIO.output(12, GPIO.HIGH)
+    else:
+        GPIO.output(13, GPIO.HIGH)
+
+    # Detection event -> extend Relay B detection timer
+    pulse_relay_b_for_detection()
+
+
+def process_frame(frame):
+    """
+    Full-resolution frame in, all drawing happens on full-res copy.
+    Detection runs on (optional ROI) and downscaled sub-image for speed, then
+    contours are mapped back to full-res for measurement + drawing.
+    """
+    global pixel_cm_ratio
+    img_full = frame.copy()
+
+    # --- Button handling (edge-triggered timers) ---
+    poll_button_and_handle_edge()
+
+    # --- ArUco detection for scale (full-res) ---
+    corners, ids, _ = aruco_detector.detectMarkers(img_full)
+    if corners:
+        int_corners = np.intp(corners)
+        cv2.polylines(img_full, int_corners, True, (0, 255, 0), 5)
+        aruco_perimeter = cv2.arcLength(corners[0], True)
+        pixel_cm_ratio = aruco_perimeter / 20.0  # Assumes 5 cm side => 20 cm perimeter
+    else:
+        cv2.putText(
+            img_full, "No ArUco marker detected: scale not set",
+            (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2
+        )
+
+    # --- ROI select ---
+    if USE_ROI:
+        x0, y0, rw, rh = ROI_RECT
+        x1, y1 = x0 + rw, y0 + rh
+        offx, offy = x0, y0
+        proc_img_full = img_full[y0:y1, x0:x1]
+        cv2.rectangle(img_full, (x0, y0), (x1, y1), (0, 200, 255), 2)
+    else:
+        offx, offy = 0, 0
+        proc_img_full = img_full
+
+    # --- Downscale processing region ---
+    fx = fy = float(DOWNSCALE_FACTOR)
+    if not (0 < fx < 1):
+        fx = fy = 1.0
+    proc_small = cv2.resize(proc_img_full, None, fx=fx, fy=fy, interpolation=cv2.INTER_AREA)
+    area_min_small = AREA_MIN * (fx * fy)
+
+    # --- Contours on small, map back to full ---
+    contours_small = detector.detect_objects(proc_small, area_min_small)
+    rects_full = []
+    if contours_small:
+        scale_back = 1.0 / fx
+        for cnt_s in contours_small:
+            cnt_full = (cnt_s.astype(np.float32) * scale_back) + np.array([[[offx, offy]]], dtype=np.float32)
+            rect = cv2.minAreaRect(cnt_full)
+            (cx, cy), (w, h), angle = rect
+            rects_full.append((cx, cy, w, h, angle))
+
+    # --- Smooth, draw, measure, and control ---
+    if pixel_cm_ratio and rects_full:
+        smoothed = smoother.update(rects_full)
+        for item in smoothed:
+            cx, cy, w_s, h_s, angle = item["x"], item["y"], item["w"], item["h"], item["angle"]
+            rect_s = ((cx, cy), (w_s, h_s), angle)
+            box = cv2.boxPoints(rect_s); box = np.intp(box)
+
+            # Length in cm (using smoothed "height" side)
+            object_length = h_s / pixel_cm_ratio
+
+            # Draw geometry
+            cv2.circle(img_full, (int(cx), int(cy)), 5, (0, 0, 255), -1)
+            cv2.polylines(img_full, [box], True, (255, 0, 0), 2)
+
+            # Draw ONLY Length label
+            label_len = f"Length {round(object_length, 1)} cm"
+            cv2.putText(
+                img_full, label_len, (int(cx - 100), int(cy + 15)),
+                cv2.FONT_HERSHEY_PLAIN, 2, (100, 200, 0), 2
+            )
+
+            # Servo gating + detection pulse for RELAY_B
+            control_servos(object_length)
+
+    # --- Apply timers to GPIO outputs (Relays & LED) ---
+    _apply_output_levels()
+
+    cv2.imshow("Image", img_full)
+
+
+def main():
+    cap = cv2.VideoCapture(0)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            process_frame(frame)
+            if cv2.waitKey(1) == 27:  # ESC
+                break
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+        GPIO.cleanup()
+
+
+if __name__ == "__main__":
+    main()
