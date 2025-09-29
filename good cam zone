@@ -1,0 +1,262 @@
+import cv2
+import numpy as np
+import math
+import time
+import RPi.GPIO as GPIO
+
+# =========================
+# GPIO setup & durations
+# =========================
+SERVO_PINS = [5, 6, 12, 13]   # Servos
+BUTTON_PIN = 17               # Button input (active LOW with pull-up)
+RELAY_A_PIN = 18              # Relay A
+LED_PIN = 27                  # Mirrors Relay A
+RELAY_B_PIN = 22              # Relay B
+
+# ---- Customizable durations (seconds) ----
+BUTTON_ON_DURATION_18 = 1.0
+BUTTON_ON_DURATION_22 = 1.0
+DETECT_ON_DURATION_22 = 2.0
+# ------------------------------------------
+
+BUTTON_DEBOUNCE_SEC = 0.05
+
+GPIO.setmode(GPIO.BCM)
+
+for pin in SERVO_PINS:
+    GPIO.setup(pin, GPIO.OUT)
+    GPIO.output(pin, GPIO.LOW)
+
+GPIO.setup(BUTTON_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+GPIO.setup(RELAY_A_PIN, GPIO.OUT, initial=GPIO.LOW)
+GPIO.setup(LED_PIN, GPIO.OUT, initial=GPIO.LOW)
+GPIO.setup(RELAY_B_PIN, GPIO.OUT, initial=GPIO.LOW)
+
+_last_raw_button_state = GPIO.input(BUTTON_PIN)
+_last_stable_button_state = _last_raw_button_state
+_last_state_change_t = time.monotonic()
+
+_relay_a_expiry_t = 0.0
+_relay_b_button_expiry_t = 0.0
+_relay_b_detect_expiry_t = 0.0
+
+
+def _now():
+    return time.monotonic()
+
+
+def _start_or_extend(expiry_ref_name, duration):
+    global _relay_a_expiry_t, _relay_b_button_expiry_t, _relay_b_detect_expiry_t
+    now = _now()
+    if expiry_ref_name == "A":
+        _relay_a_expiry_t = max(_relay_a_expiry_t, now + duration)
+    elif expiry_ref_name == "B_BUTTON":
+        _relay_b_button_expiry_t = max(_relay_b_button_expiry_t, now + duration)
+    elif expiry_ref_name == "B_DETECT":
+        _relay_b_detect_expiry_t = max(_relay_b_detect_expiry_t, now + duration)
+
+
+def _apply_output_levels():
+    now = _now()
+    a_on = now < _relay_a_expiry_t
+    b_on = now < max(_relay_b_button_expiry_t, _relay_b_detect_expiry_t)
+
+    GPIO.output(RELAY_A_PIN, GPIO.HIGH if a_on else GPIO.LOW)
+    GPIO.output(LED_PIN, GPIO.HIGH if a_on else GPIO.LOW)
+    GPIO.output(RELAY_B_PIN, GPIO.HIGH if b_on else GPIO.LOW)
+
+    return a_on, b_on  # return states for overlay
+
+
+def poll_button_and_handle_edge():
+    global _last_raw_button_state, _last_stable_button_state, _last_state_change_t
+
+    now = _now()
+    raw = GPIO.input(BUTTON_PIN)
+
+    if raw != _last_raw_button_state:
+        _last_raw_button_state = raw
+        _last_state_change_t = now
+
+    if now - _last_state_change_t >= BUTTON_DEBOUNCE_SEC:
+        if raw != _last_stable_button_state:
+            prev = _last_stable_button_state
+            _last_stable_button_state = raw
+            if prev == GPIO.HIGH and raw == GPIO.LOW:
+                _start_or_extend("A", BUTTON_ON_DURATION_18)
+                _start_or_extend("B_BUTTON", BUTTON_ON_DURATION_22)
+
+
+def pulse_relay_b_for_detection():
+    _start_or_extend("B_DETECT", DETECT_ON_DURATION_22)
+
+
+# =========================
+# Vision setup
+# =========================
+BLUR_KSIZE = (5, 5)
+MORPH_KSIZE = (3, 3)
+OPEN_ITER = 1
+CLOSE_ITER = 1
+ADAPTIVE_BLOCK_SIZE = 19
+ADAPTIVE_C = 5
+AREA_MIN = 2000
+
+DOWNSCALE_FACTOR = 0.5
+USE_ROI = True
+ROI_RECT = (1, 200, 1050, 420)
+
+
+class DetectorObj:
+    def __init__(self):
+        self.kernel = cv2.getStructuringElement(cv2.MORPH_RECT, MORPH_KSIZE)
+
+    def detect_objects(self, frame_small, area_min_small):
+        gray = cv2.cvtColor(frame_small, cv2.COLOR_BGR2GRAY)
+        gray_blur = cv2.GaussianBlur(gray, BLUR_KSIZE, 0)
+        mask = cv2.adaptiveThreshold(
+            gray_blur, 255,
+            cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV,
+            ADAPTIVE_BLOCK_SIZE, ADAPTIVE_C
+        )
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, self.kernel, iterations=OPEN_ITER)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self.kernel, iterations=CLOSE_ITER)
+
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        return [cnt for cnt in contours if cv2.contourArea(cnt) > area_min_small]
+
+
+parameters = cv2.aruco.DetectorParameters()
+aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_5X5_50)
+aruco_detector = cv2.aruco.ArucoDetector(aruco_dict, parameters)
+
+pixel_cm_ratio = None
+detector = DetectorObj()
+
+
+# =========================
+# Servo control
+# =========================
+def control_servos(length_cm):
+    for pin in SERVO_PINS:
+        GPIO.output(pin, GPIO.LOW)
+
+    active_servo = None
+    if 8.7 <= length_cm <= 10.0:
+        GPIO.output(5, GPIO.HIGH)
+        active_servo = 5
+    elif 10.0 < length_cm <= 11.4:
+        GPIO.output(6, GPIO.HIGH)
+        active_servo = 6
+    elif 11.6 <= length_cm <= 14.3:
+        GPIO.output(12, GPIO.HIGH)
+        active_servo = 12
+    else:
+        GPIO.output(13, GPIO.HIGH)
+        active_servo = 13
+
+    pulse_relay_b_for_detection()
+    return active_servo
+
+
+def process_frame(frame):
+    global pixel_cm_ratio
+    img_full = frame.copy()
+
+    poll_button_and_handle_edge()
+
+    corners, ids, _ = aruco_detector.detectMarkers(img_full)
+    if corners:
+        int_corners = np.intp(corners)
+        cv2.polylines(img_full, int_corners, True, (0, 255, 0), 5)
+        aruco_perimeter = cv2.arcLength(corners[0], True)
+        pixel_cm_ratio = aruco_perimeter / 20.0
+    else:
+        cv2.putText(img_full, "No ArUco marker detected: scale not set",
+                    (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+
+    if USE_ROI:
+        x0, y0, rw, rh = ROI_RECT
+        x1, y1 = x0 + rw, y0 + rh
+        offx, offy = x0, y0
+        proc_img_full = img_full[y0:y1, x0:x1]
+        cv2.rectangle(img_full, (x0, y0), (x1, y1), (0, 200, 255), 2)
+    else:
+        offx, offy = 0, 0
+        proc_img_full = img_full
+
+    fx = fy = float(DOWNSCALE_FACTOR)
+    if not (0 < fx < 1):
+        fx = fy = 1.0
+    proc_small = cv2.resize(proc_img_full, None, fx=fx, fy=fy, interpolation=cv2.INTER_AREA)
+    area_min_small = AREA_MIN * (fx * fy)
+
+    contours_small = detector.detect_objects(proc_small, area_min_small)
+    rects_full = []
+    if contours_small:
+        scale_back = 1.0 / fx
+        for cnt_s in contours_small:
+            cnt_full = (cnt_s.astype(np.float32) * scale_back) + np.array([[[offx, offy]]], dtype=np.float32)
+            rect = cv2.minAreaRect(cnt_full)
+            (cx, cy), (w, h), angle = rect
+            rects_full.append((cx, cy, w, h, angle))
+
+    active_servo = None
+    if pixel_cm_ratio and rects_full:
+        for (cx, cy, w, h, angle) in rects_full:
+            rect_s = ((cx, cy), (w, h), angle)
+            box = cv2.boxPoints(rect_s)
+            box = np.intp(box)
+
+            longer_side = max(w, h)
+            object_length = longer_side / pixel_cm_ratio
+
+            cv2.circle(img_full, (int(cx), int(cy)), 5, (0, 0, 255), -1)
+            cv2.polylines(img_full, [box], True, (255, 0, 0), 2)
+
+            label_len = f"Length {round(object_length, 1)} cm"
+            cv2.putText(img_full, label_len, (int(cx - 100), int(cy + 15)),
+                        cv2.FONT_HERSHEY_PLAIN, 2, (100, 200, 0), 2)
+
+            active_servo = control_servos(object_length)
+
+    a_on, b_on = _apply_output_levels()
+
+    # --- On-screen indicators ---
+    y = 60
+    cv2.putText(img_full, f"Relay A: {'ON' if a_on else 'OFF'}", (20, y),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0) if a_on else (0, 0, 255), 2)
+    y += 25
+    cv2.putText(img_full, f"Relay B: {'ON' if b_on else 'OFF'}", (20, y),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0) if b_on else (0, 0, 255), 2)
+
+    y += 25
+    for pin in SERVO_PINS:
+        state = GPIO.input(pin)
+        cv2.putText(img_full, f"Servo {pin}: {'ON' if state else 'OFF'}", (20, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0) if state else (0, 0, 255), 2)
+        y += 25
+
+    cv2.imshow("Image", img_full)
+
+
+def main():
+    cap = cv2.VideoCapture(0)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            process_frame(frame)
+            if cv2.waitKey(1) == 27:
+                break
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+        GPIO.cleanup()
+
+
+if __name__ == "__main__":
+    main()
