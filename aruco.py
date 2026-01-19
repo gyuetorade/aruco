@@ -171,7 +171,7 @@ AREA_MIN = 2000
 
 DOWNSCALE_FACTOR = 0.5
 USE_ROI = True
-ROI_RECT = (200, 200, 850, 420)
+ROI_RECT = (200, 200, 1500, 720)
 
 detector_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, MORPH_KSIZE)
 
