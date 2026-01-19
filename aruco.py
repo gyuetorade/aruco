@@ -321,7 +321,11 @@ def process_frame(frame):
         park_all_servos()
 
     _apply_output_levels()
+
+
+    img_full = cv2.resize(img_full, (1024, 768))  # Change these numbers to fit your screen
     cv2.imshow("Image", img_full)
+    
 
 # =========================
 # Main
@@ -332,7 +336,7 @@ def main():
     
     # Configure for RGB format (not RGBA)
     config = picam2.create_preview_configuration(
-        main={"size": (640, 480), "format": "RGB888"}
+        main={"size": (1920, 1080), "format": "RGB888"}
     )
     picam2.configure(config)
     
@@ -344,9 +348,6 @@ def main():
     try:
         while True:
             frame = picam2.capture_array()
-            
-            # Debug: check frame shape
-            print(f"Frame shape: {frame.shape}, dtype: {frame.dtype}")
             
             # If frame has 4 channels (RGBA), convert to 3 (RGB)
             if len(frame.shape) == 3 and frame.shape[2] == 4:
