@@ -416,7 +416,7 @@ def park_all_servos():
 # 2-Frame Confirmation System
 # =========================
 def _check_length_confirmation(current_length_cm):
-    """Check if we have 2 consecutive frames with the same length over 0.5 seconds"""
+    """Check if we have 2 consecutive frames with the same length over minimum duration"""
     global _frame_history
     
     now = _now()
