@@ -22,6 +22,8 @@ RELAY_B_ACTIVE_LOW = False
 # =========================
 # Enable/Disable Relay B
 RELAY_B_ENABLED = False  # Set to False to disable Relay B completely
+# Enable/Disable System Busy blocking
+SYSTEM_BUSY_ENABLED = True  # Set to False to allow measurements while servo/relay is active
 
 # Durations (in seconds)
 BUTTON_ON_DURATION_18 = 1.0  # Relay A duration when button pressed

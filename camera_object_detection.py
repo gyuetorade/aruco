@@ -22,6 +22,8 @@ RELAY_B_ACTIVE_LOW = False
 # =========================
 # Enable/Disable Relay B
 RELAY_B_ENABLED = False  # Set to False to disable Relay B completely
+# Enable/Disable System Busy blocking
+SYSTEM_BUSY_ENABLED = True  # Set to False to allow measurements while servo/relay is active
 
 # Durations (in seconds)
 BUTTON_ON_DURATION_18 = 1.0  # Relay A duration when button pressed
@@ -453,8 +455,8 @@ def _check_length_confirmation(current_length_cm):
     """Check if we have 2 consecutive frames with the same length over 0.5 seconds"""
     global _frame_history
     
-    # If system is busy (servo or relay active), don't process new confirmations
-    if _system_busy:
+    # If system is busy (servo or relay active), don't process new confirmations (if enabled)
+    if SYSTEM_BUSY_ENABLED and _system_busy:
         return None
     
     now = _now()
@@ -493,8 +495,8 @@ def control_servos_with_confirmation(length_cm):
     """Control servos only after 2-frame confirmation"""
     global _active_servo_pin, _frame_history, _system_busy
     
-    # If system is already busy (servo or relay active), don't start new actions
-    if _system_busy:
+    # If system is already busy (servo or relay active), don't start new actions (if enabled)
+    if SYSTEM_BUSY_ENABLED and _system_busy:
         return length_cm, False, 0.0
     
     # Check for 2-frame confirmation
@@ -584,8 +586,8 @@ def process_object_detection(frame):
     # Store busy state globally
     _system_busy = system_busy
     
-    # If system is busy, skip ALL object detection processing
-    if system_busy:
+    # If system is busy AND system busy blocking is enabled, skip ALL object detection processing
+    if SYSTEM_BUSY_ENABLED and system_busy:
         # Display system busy message
         cv2.putText(img_full, "SYSTEM BUSY - Waiting for timer...", 
                     (img_full.shape[1]//2 - 250, img_full.shape[0]//2), 
