@@ -1,459 +1,284 @@
 import cv2
-import numpy as np
-import time
 import RPi.GPIO as GPIO
-import math
 from picamera2 import Picamera2
+from ultralytics import YOLO
+import time
+import numpy as np
+from collections import deque
 
 # =========================
-# GPIO Setup
+# GPIO SETUP
 # =========================
 BUTTON_PIN = 17
+RELAY_1_PIN = 23  # First relay for complete detection
+RELAY_2_PIN = 24  # Second relay for complete detection
+
+# Button logic configuration
+USE_ACTIVE_HIGH = False  # Set to True for active HIGH, False for active LOW
+
+GPIO.setmode(GPIO.BCM)
+
+# Configure button pin based on active high/low preference
+if USE_ACTIVE_HIGH:
+    GPIO.setup(BUTTON_PIN, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)  # Active HIGH logic
+    print(f"Button configured as ACTIVE HIGH (press = HIGH)")
+else:
+    GPIO.setup(BUTTON_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)    # Active LOW logic (default)
+    print(f"Button configured as ACTIVE LOW (press = LOW)")
+
+# Configure relay pins
+GPIO.setup(RELAY_1_PIN, GPIO.OUT)
+GPIO.setup(RELAY_2_PIN, GPIO.OUT)
+
+# Turn off relays initially (assuming LOW = off, HIGH = on)
+GPIO.output(RELAY_1_PIN, GPIO.LOW)
+GPIO.output(RELAY_2_PIN, GPIO.LOW)
+print(f"Relays initialized on pins {RELAY_1_PIN} and {RELAY_2_PIN} (LOW = OFF)")
+
+# =========================
+# RELAY CONFIGURATION
+# =========================
+RELAY_ACTIVATION_DURATION = 5.0  # How long relays stay active for complete detection (seconds)
+_relay_expiry_t = 0.0  # Timer for relay activation
+_relay_active = False  # Track if relays are currently active
+
+# =========================
+# SERVO CONFIGURATION
+# =========================
+# Servo Pins
 SERVO_PINS = [5, 6, 12, 13]
-RELAY_A_PIN = 23
-RELAY_B_PIN = 24
 
-# Relay configuration
-RELAY_A_ACTIVE_LOW = True
-RELAY_B_ACTIVE_LOW = False
-
-# =========================
-# CONFIGURABLE SETTINGS
-# =========================
-# Enable/Disable Relay B
-RELAY_B_ENABLED = False  # Set to False to disable Relay B completely
-
-# Durations (in seconds)
-BUTTON_ON_DURATION_18 = 1.0  # Relay A duration when button pressed
-BUTTON_ON_DURATION_22 = 1.0  # Relay B duration when button pressed
-
-# Unified activation times (in seconds) - same for both servo AND Relay B
-ACTIVATION_DURATIONS = {
-    5: 2.0,   # When object goes to servo 5: servo AND Relay B stay active for 2.0s
-    6: 2.0,   # When object goes to servo 6: servo AND Relay B stay active for 2.0s  
-    12: 2.0,  # When object goes to servo 12: servo AND Relay B stay active for 2.0s
-    13: 2.0   # When object goes to servo 13: servo AND Relay B stay active for 2.0s
+# Servo Positions - Start and End angles for each servo
+SERVO_POSITIONS = {
+    5:  {"start": 150,  "end": 100},  # Servo 5: Start at 150Â°, move to 100Â° when activated
+    6:  {"start": 150,  "end": 100},  # Servo 6: Start at 150Â°, move to 100Â° when activated
+    12: {"start": 30,   "end": 80},   # Servo 12: Start at 30Â°, move to 80Â° when activated
+    13: {"start": 30,   "end": 80},   # Servo 13: Start at 30Â°, move to 80Â° when activated
 }
 
-BUTTON_DEBOUNCE_SEC = 0.05
+# Activation durations (in seconds) for each servo
+ACTIVATION_DURATIONS = {
+    5: 10.0,   # Servo 5 stays active for 10.0 seconds
+    6: 10.0,   # Servo 6 stays active for 10.0 seconds  
+    12: 10.0,  # Servo 12 stays active for 10.0 seconds
+    13: 10.0   # Servo 13 stays active for 10.0 seconds
+}
 
-# Object Detection Parameters
-BLUR_KSIZE = (5, 5)
-MORPH_KSIZE = (3, 3)
-OPEN_ITER = 1
-CLOSE_ITER = 1
-ADAPTIVE_BLOCK_SIZE = 19
-ADAPTIVE_C = 5
-AREA_MIN = 2000
-DOWNSCALE_FACTOR = 0.5
+# =========================
+# MEASUREMENT CONFIGURATION
+# =========================
+# TIME-BASED Confirmation
+_CONFIRMATION_WINDOW_SEC = 1.0  # Check stability over 1 second window
+_LENGTH_TOLERANCE_CM = 0.3      # Measurements must be within this tolerance
 
-# ROI Configuration
-USE_ROI = True
-ROI_RECT = (200, 200, 850, 420)  # (x, y, width, height)
-
-# 2-Frame Confirmation
-_CONFIRMATION_FRAMES = 2
-_LENGTH_TOLERANCE_CM = 0.3
-
-# ArUco Parameters
-MARKER_SIZE_CM = 5.00
-CALIB_K = 1.00
-SCALE_EMA_ALPHA = 0.3
+# Manual Pixel-per-cm Calibration
+MANUAL_PX_PER_CM = 25.0  # Default value, adjust based on your setup
+CALIB_K = 1.00  # Calibration multiplier (adjust if measurements are off)
 
 # Stability tuning
-LENGTH_EMA_ALPHA = 0.2
-HYSTERESIS_CM = 0.6
-LOCK_MS = 400
-MAX_CENTER_JUMP = 120
+LENGTH_EMA_ALPHA = 0.3  # Increased for Roboflow stability
 
 # =========================
-# Initialize GPIO
+# SYSTEM STATE VARIABLES
 # =========================
-GPIO.setmode(GPIO.BCM)
-GPIO.setwarnings(False)
+# Measurement variables
+pixel_cm_ratio = MANUAL_PX_PER_CM
+_stable_length_cm = None
+_measurement_history = deque(maxlen=30)
+_active_servo_pin = None
+_system_busy = False
+SYSTEM_BUSY_ENABLED = False
 
-# Setup pins
-for pin in SERVO_PINS:
-    GPIO.setup(pin, GPIO.OUT)
-    GPIO.output(pin, GPIO.LOW)
-
-GPIO.setup(BUTTON_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-
-# Setup relays with proper initial states
-if RELAY_A_ACTIVE_LOW:
-    GPIO.setup(RELAY_A_PIN, GPIO.OUT, initial=GPIO.HIGH)
-else:
-    GPIO.setup(RELAY_A_PIN, GPIO.OUT, initial=GPIO.LOW)
-
-if RELAY_B_ACTIVE_LOW:
-    GPIO.setup(RELAY_B_PIN, GPIO.OUT, initial=GPIO.HIGH)
-else:
-    GPIO.setup(RELAY_B_PIN, GPIO.OUT, initial=GPIO.LOW)
-
-# =========================
-# Camera State and Switching
-# =========================
-_current_camera = "webcam"  # Start with webcam
-_last_button_state = GPIO.input(BUTTON_PIN)
-_last_stable_button_state = _last_button_state
-_last_state_change_t = time.monotonic()
-
-# Camera objects
-webcam = None
-picam2 = None
-current_capture = None
-
-# =========================
-# Object Detection State Variables
-# =========================
-# Timing/state variables
-_last_raw_button_state_obj = GPIO.input(BUTTON_PIN)
-_last_stable_button_state_obj = _last_raw_button_state_obj
-_last_state_change_t_obj = time.monotonic()
-
-_relay_a_expiry_t = 0.0
-_relay_b_button_expiry_t = 0.0
-_relay_b_detect_expiry_t = 0.0
+# Servo variables
+servo_pwm = {}  # Dictionary to store PWM objects for each servo
 _servo_expiry_t = 0.0  # Timer for servo activation
 
-# Object detection variables
-pixel_cm_ratio = None
-_last_scale = None
-_stable_length_cm = None
-_locked_until_t = 0.0
-_prev_center = None
-_frame_history = []
-_active_servo_pin = None  # Initialize at module level
-_relay_b_active = False  # Track if Relay B is currently active
+# Detection tracking
+_last_detection_time = 0.0
+_no_detection_threshold = 2.0  # 2 seconds without detection resets measurement
+
+# Current camera mode
+camera_mode = 0  # 0 = Webcam (samaral detection + measurement), 1 = Pi Camera (complete/incomplete + relays)
+button_pressed = False
+
+# Complete detection tracking (for Pi Camera mode)
+_complete_detected = False
+_complete_confirmation_history = deque(maxlen=10)  # Track complete detections for confirmation
+_COMPLETE_CONFIRMATION_FRAMES = 5  # Need 5 consecutive frames of complete detection
 
 # =========================
-# Utility Functions
+# TIME AND UTILITY FUNCTIONS
 # =========================
 def _now():
-    return time.monotonic()
+    """Get current time in seconds"""
+    return time.time()
 
 def _ema(prev, new, alpha):
+    """Exponential Moving Average for smoothing measurements"""
     return new if prev is None else (alpha * new + (1 - alpha) * prev)
 
-def _order_box_points(pts):
-    s = pts.sum(axis=1)
-    diff = np.diff(pts, axis=1).ravel()
-    tl = pts[np.argmin(s)]
-    br = pts[np.argmax(s)]
-    tr = pts[np.argmin(diff)]
-    bl = pts[np.argmax(diff)]
-    return np.array([tl, tr, br, bl], dtype=np.int32)
-
-def _draw_long_side(img, box, color=(0, 255, 255), thickness=3):
-    tl, tr, br, bl = box
-    len_top = np.linalg.norm(tr - tl)
-    len_right = np.linalg.norm(br - tr)
-    if len_top >= len_right:
-        p1, p2 = tl, tr
-        p3, p4 = bl, br
-    else:
-        p1, p2 = tr, br
-        p3, p4 = tl, bl
-    cv2.line(img, tuple(p1), tuple(p2), color, thickness)
-    cv2.line(img, tuple(p3), tuple(p4), color, thickness)
-
 # =========================
-# Camera Switching Functions
+# RELAY CONTROL FUNCTIONS
 # =========================
-def poll_camera_switch_button():
-    """Poll button with debouncing for camera switching"""
-    global _last_button_state, _last_stable_button_state, _last_state_change_t
-    global _current_camera
+def activate_relays(duration=RELAY_ACTIVATION_DURATION):
+    """Activate both relays for specified duration"""
+    global _relay_expiry_t, _relay_active
     
-    now = _now()
-    raw = GPIO.input(BUTTON_PIN)
+    print(f"âœ“ Activating relays 23 & 24 for {duration} seconds")
     
-    # Detect raw state change
-    if raw != _last_button_state:
-        _last_button_state = raw
-        _last_state_change_t = now
+    # Turn ON both relays
+    GPIO.output(RELAY_1_PIN, GPIO.HIGH)
+    GPIO.output(RELAY_2_PIN, GPIO.HIGH)
     
-    # Only update stable state after debounce period
-    if now - _last_state_change_t >= BUTTON_DEBOUNCE_SEC:
-        if raw != _last_stable_button_state:
-            prev = _last_stable_button_state
-            _last_stable_button_state = raw
-            
-            # Detect button PRESS (HIGH to LOW transition)
-            if prev == GPIO.HIGH and raw == GPIO.LOW:
-                # Toggle camera
-                if _current_camera == "webcam":
-                    _current_camera = "picam"
-                    print("Switching to Raspberry Pi Camera")
-                else:
-                    _current_camera = "webcam"
-                    print("Switching to USB Webcam")
-                
-                # Close current camera and open new one
-                switch_camera(_current_camera)
-                return True
+    # Set expiry time
+    _relay_expiry_t = _now() + duration
+    _relay_active = True
     
-    return False
+    return True
 
-def init_webcam():
-    """Initialize USB webcam"""
-    global webcam, current_capture
+def deactivate_relays():
+    """Deactivate both relays"""
+    global _relay_active
     
-    try:
-        if webcam is None or not webcam.isOpened():
-            webcam = cv2.VideoCapture(0)
-            if webcam.isOpened():
-                webcam.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-                webcam.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-                print("USB Webcam initialized")
-                current_capture = webcam
-                return True
-            else:
-                print("Failed to open USB webcam")
-                return False
-        current_capture = webcam
+    if _relay_active:
+        print("âœ“ Deactivating relays 23 & 24")
+        GPIO.output(RELAY_1_PIN, GPIO.LOW)
+        GPIO.output(RELAY_2_PIN, GPIO.LOW)
+        _relay_active = False
         return True
-    except Exception as e:
-        print(f"Failed to initialize USB webcam: {e}")
-        return False
-
-def init_picam():
-    """Initialize Raspberry Pi Camera"""
-    global picam2, current_capture
-    
-    try:
-        if picam2 is None:
-            picam2 = Picamera2()
-            config = picam2.create_preview_configuration(
-                main={"size": (1280, 720), "format": "RGB888"}
-            )
-            picam2.configure(config)
-            picam2.start()
-            time.sleep(1)  # Warm up
-            print("Raspberry Pi Camera initialized")
-        
-        current_capture = picam2
-        return True
-    except Exception as e:
-        print(f"Failed to initialize Raspberry Pi Camera: {e}")
-        return False
-
-def switch_camera(camera_type):
-    """Switch between cameras"""
-    global current_capture
-    
-    # Initialize new camera
-    if camera_type == "webcam":
-        if init_webcam():
-            return True
-        else:
-            print("Failed to switch to USB webcam")
-            return False
-    elif camera_type == "picam":
-        if init_picam():
-            return True
-        else:
-            print("Failed to switch to Raspberry Pi Camera")
-            return False
-    
     return False
 
-def get_frame():
-    """Get frame from current camera"""
-    global current_capture, _current_camera
+def check_relay_timer():
+    """Check if relay timer has expired and deactivate if needed"""
+    global _relay_active
     
-    if current_capture is None:
-        return None
-    
-    try:
-        if _current_camera == "webcam":
-            ret, frame = current_capture.read()
-            if not ret:
-                print("Failed to grab frame from USB webcam")
-                return None
-            return frame
-        else:  # picam
-            frame = current_capture.capture_array()
-            # Convert from RGB to BGR for OpenCV
-            if len(frame.shape) == 3 and frame.shape[2] == 4:
-                frame = cv2.cvtColor(frame, cv2.COLOR_RGBA2BGR)
-            elif len(frame.shape) == 3 and frame.shape[2] == 3:
-                frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-            return frame
-    except Exception as e:
-        print(f"Error getting frame from {_current_camera}: {e}")
-        return None
+    if _relay_active and _now() >= _relay_expiry_t:
+        deactivate_relays()
+        return False
+    return _relay_active
 
 # =========================
-# Relay Control Functions (Object Detection Only)
-# =========================
-def _start_or_extend(expiry_ref_name, duration):
-    """Only extends timers, doesn't activate relays directly"""
-    global _relay_a_expiry_t, _relay_b_button_expiry_t, _relay_b_detect_expiry_t, _servo_expiry_t
-    
-    now = _now()
-    if expiry_ref_name == "A":
-        _relay_a_expiry_t = max(_relay_a_expiry_t, now + duration)
-    elif expiry_ref_name == "B_BUTTON":
-        _relay_b_button_expiry_t = max(_relay_b_button_expiry_t, now + duration)
-    elif expiry_ref_name == "B_DETECT":
-        _relay_b_detect_expiry_t = max(_relay_b_detect_expiry_t, now + duration)
-    elif expiry_ref_name == "SERVO":
-        _servo_expiry_t = max(_servo_expiry_t, now + duration)
-
-def _drive_relay(pin, on, active_low):
-    """Control relay output"""
-    if active_low:
-        # Active LOW relay: ON when pin is LOW
-        GPIO.output(pin, GPIO.LOW if on else GPIO.HIGH)
-    else:
-        # Active HIGH relay: ON when pin is HIGH  
-        GPIO.output(pin, GPIO.HIGH if on else GPIO.LOW)
-
-def _apply_output_levels():
-    """Actually applies the relay states based on timers"""
-    global _relay_b_active, _active_servo_pin  # Add _active_servo_pin here
-    
-    now = _now()
-    
-    # Relay A: Only ON if button timer is active
-    a_on = now < _relay_a_expiry_t
-    
-    # Relay B: ON if either button timer OR detection timer is active (if enabled)
-    if RELAY_B_ENABLED:
-        b_on = now < max(_relay_b_button_expiry_t, _relay_b_detect_expiry_t)
-    else:
-        b_on = False  # Relay B disabled
-    
-    # Track if Relay B is currently active
-    _relay_b_active = b_on
-    
-    # Apply relays
-    _drive_relay(RELAY_A_PIN, a_on, RELAY_A_ACTIVE_LOW)
-    _drive_relay(RELAY_B_PIN, b_on, RELAY_B_ACTIVE_LOW)
-    
-    # Check if servo timer has expired
-    servo_on = now < _servo_expiry_t
-    if not servo_on and _active_servo_pin is not None:
-        # Servo timer expired, park the servo
-        park_all_servos()
-        _active_servo_pin = None
-
-    return a_on, b_on, servo_on
-
-def poll_object_detection_button():
-    """Polls button with debouncing and triggers relay timers on press"""
-    global _last_raw_button_state_obj, _last_stable_button_state_obj, _last_state_change_t_obj
-
-    now = _now()
-    raw = GPIO.input(BUTTON_PIN)
-
-    # Detect raw state change
-    if raw != _last_raw_button_state_obj:
-        _last_raw_button_state_obj = raw
-        _last_state_change_t_obj = now
-
-    # Only update stable state after debounce period
-    if now - _last_state_change_t_obj >= BUTTON_DEBOUNCE_SEC:
-        if raw != _last_stable_button_state_obj:
-            prev = _last_stable_button_state_obj
-            _last_stable_button_state_obj = raw
-            
-            # Detect button PRESS (HIGH to LOW transition, active-LOW button)
-            if prev == GPIO.HIGH and raw == GPIO.LOW:
-                # Button pressed: Start timers for BOTH relays
-                _start_or_extend("A", BUTTON_ON_DURATION_18)
-                _start_or_extend("B_BUTTON", BUTTON_ON_DURATION_22)
-                return True
-    
-    return False
-
-def pulse_relay_b_for_detection(duration):
-    """Triggers Relay B for object detection with specified duration"""
-    if RELAY_B_ENABLED:  # Only trigger if Relay B is enabled
-        _start_or_extend("B_DETECT", duration)
-
-# =========================
-# Servo PWM Setup
-# =========================
-servo_pwm = {}
-
-def setup_servos():
-    for pin in SERVO_PINS:
-        pwm = GPIO.PWM(pin, 50)  # 50Hz
-        pwm.start(7.5)            # Neutral 90°
-        servo_pwm[pin] = pwm
-
-def stop_servos():
-    for pwm in servo_pwm.values():
-        pwm.stop()
-
-def _angle_to_duty(angle):
-    # Map 0-180° -> 2.5-12.5 duty cycle
-    return 2.5 + (angle / 180.0) * 10.0
-
-BIN_ANGLES = {5: 60, 6: 90, 12: 120, 13: 30}
-REVERSE = {5: False, 6: False, 12: False, 13: True}
-
-def _move_servo(pin, angle):
-    if REVERSE.get(pin, False):
-        angle = 180 - angle
-    servo_pwm[pin].ChangeDutyCycle(_angle_to_duty(angle))
-
-def _park_others(active_pin):
-    for p in SERVO_PINS:
-        if p != active_pin:
-            _move_servo(p, 90)
-
-def park_all_servos():
-    for p in SERVO_PINS:
-        _move_servo(p, 90)
-
-# =========================
-# 2-Frame Confirmation System
+# TIME-BASED CONFIRMATION SYSTEM
 # =========================
 def _check_length_confirmation(current_length_cm):
-    """Check if we have 2 consecutive frames with the same length"""
-    global _frame_history
+    """Check if measurements are stable within 1-second window"""
+    global _measurement_history, _last_detection_time
+    
+    if SYSTEM_BUSY_ENABLED and _system_busy:
+        return None
+    
+    # ONLY check confirmation in webcam mode (samaral mode)
+    if camera_mode != 0:
+        return None
     
     now = _now()
     
-    # Clean old entries (older than 1 second)
-    _frame_history = [(length, ts) for length, ts in _frame_history if now - ts < 1.0]
+    # Check if too much time has passed since last detection
+    if now - _last_detection_time > _no_detection_threshold:
+        _measurement_history.clear()
+        return None
     
-    # Add current measurement
-    _frame_history.append((current_length_cm, now))
+    # Add current measurement with timestamp
+    _measurement_history.append((current_length_cm, now))
+    _last_detection_time = now
     
-    # Keep only last N frames (N = CONFIRMATION_FRAMES + 1 for buffer)
-    if len(_frame_history) > _CONFIRMATION_FRAMES + 1:
-        _frame_history = _frame_history[-(_CONFIRMATION_FRAMES + 1):]
+    # Remove measurements older than confirmation window
+    while _measurement_history and now - _measurement_history[0][1] > _CONFIRMATION_WINDOW_SEC:
+        _measurement_history.popleft()
     
-    # Check if we have enough frames
-    if len(_frame_history) >= _CONFIRMATION_FRAMES:
-        # Get the last N frames
-        recent_frames = _frame_history[-_CONFIRMATION_FRAMES:]
+    if len(_measurement_history) >= 2:
+        # Get all measurements in the time window
+        measurements = [length for length, ts in _measurement_history]
         
-        # Check if all recent frames have approximately the same length
-        lengths = [frame[0] for frame in recent_frames]
-        min_length = min(lengths)
-        max_length = max(lengths)
+        min_length = min(measurements)
+        max_length = max(measurements)
         
-        # If all lengths are within tolerance, confirmation achieved
+        # Check if measurements are stable within tolerance
         if (max_length - min_length) <= _LENGTH_TOLERANCE_CM:
-            # Return the average length
-            return np.mean(lengths)
+            time_span = now - _measurement_history[0][1]
+            if time_span >= _CONFIRMATION_WINDOW_SEC:
+                confirmed_length = np.mean(measurements)
+                print(f"? Measurement confirmed: {confirmed_length:.1f}cm (from {len(measurements)} samples)")
+                return confirmed_length
     
-    return None  # No confirmation yet
+    return None
 
-def control_servos_with_confirmation(length_cm):
-    """Control servos only after 2-frame confirmation"""
-    global _active_servo_pin, _frame_history
+# =========================
+# SERVO PWM SETUP AND CONTROL (IMPROVED - NO DRIFT)
+# =========================
+def setup_servos():
+    """Initialize all servos to their start positions"""
+    print("Setting up servos...")
+    for pin in SERVO_PINS:
+        GPIO.setup(pin, GPIO.OUT)
+        pwm = GPIO.PWM(pin, 50)  # 50Hz frequency for servos
+        pwm.start(0)  # Start with 0 duty cycle
+        servo_pwm[pin] = pwm
+        time.sleep(0.1)
     
-    # Check for 2-frame confirmation
+    # Move all servos to start positions
+    for pin in SERVO_PINS:
+        _move_servo_to_position(pin, SERVO_POSITIONS[pin]["start"])
+    
+    print(f"Servos initialized: {SERVO_PINS}")
+
+def stop_servos():
+    """Cleanup servo PWM"""
+    print("Stopping servos...")
+    for pwm in servo_pwm.values():
+        pwm.stop()
+    print("Servos stopped and cleaned up")
+
+def _angle_to_duty(angle):
+    """Convert angle (0-180) to duty cycle (2.5-12.5) - STABLE VERSION"""
+    angle = max(0, min(180, angle))  # Clamp angle to valid range
+    return 2.5 + (angle / 18.0)  # More stable calculation
+
+def _move_servo_to_position(pin, angle):
+    """Move specific servo to given angle and STOP signal to prevent drift"""
+    if pin in servo_pwm:
+        duty = _angle_to_duty(angle)
+        servo_pwm[pin].ChangeDutyCycle(duty)
+        time.sleep(0.2)  # Give time to move to position (0.2s is enough)
+        servo_pwm[pin].ChangeDutyCycle(0)  # CRITICAL: Stop sending signal to hold position
+        print(f"Servo {pin} moved to {angle}Â° and signal stopped")
+
+def _move_servo_to_start(pin):
+    """Move servo to its start position"""
+    if pin in SERVO_POSITIONS:
+        start_pos = SERVO_POSITIONS[pin]["start"]
+        _move_servo_to_position(pin, start_pos)
+
+def _move_servo_to_end(pin):
+    """Move servo to its end position (activated state)"""
+    if pin in SERVO_POSITIONS:
+        end_pos = SERVO_POSITIONS[pin]["end"]
+        _move_servo_to_position(pin, end_pos)
+
+def _park_others(active_pin):
+    """Move all other servos to their start positions"""
+    for p in SERVO_PINS:
+        if p != active_pin and p in servo_pwm:
+            _move_servo_to_start(p)
+
+# =========================
+# SERVO ACTIVATION CONTROL - UPDATED (NO DRIFT)
+# =========================
+def control_servos_with_confirmation(length_cm, current_class):
+    """Control servos based on measured length - ONLY for samaral class in webcam mode"""
+    global _active_servo_pin, _measurement_history, _system_busy, _servo_expiry_t
+    
+    if SYSTEM_BUSY_ENABLED and _system_busy:
+        return length_cm, False, 0.0
+    
+    # ONLY activate servos in webcam mode for samaral class
+    if camera_mode != 0 or current_class.lower() != "samaral":
+        return length_cm, False, 0.0
+    
     confirmed_length = _check_length_confirmation(length_cm)
     
     if confirmed_length is not None:
-        # Confirmation achieved! Now control servos
+        # Determine which servo to activate based on length
         if 8.7 <= confirmed_length <= 10.0:
             sel = 5
         elif 10.0 < confirmed_length <= 11.5:
@@ -463,523 +288,713 @@ def control_servos_with_confirmation(length_cm):
         else:
             sel = 13
         
-        # Get unified activation duration from config
         unified_duration = ACTIVATION_DURATIONS.get(sel, 2.0)
         
-        # Move servo and start timer
-        _move_servo(sel, BIN_ANGLES[sel])
-        _park_others(sel)
-        _active_servo_pin = sel
-        _start_or_extend("SERVO", unified_duration)
+        print(f"âœ“ Activating Servo {sel} for {unified_duration}s (Length: {confirmed_length:.1f}cm)")
         
-        # Activate Relay B with SAME duration (if enabled)
-        if RELAY_B_ENABLED:
-            pulse_relay_b_for_detection(unified_duration)
+        # Activate the selected servo
+        _move_servo_to_end(sel)      # Move to end position
+        _park_others(sel)            # Move others to start positions
+        _active_servo_pin = sel      # Set as active servo
+        _servo_expiry_t = _now() + unified_duration  # Set expiry time
         
-        # Clear history after successful confirmation to avoid repeated triggers
-        _frame_history = []
+        # Clear measurement history after activation
+        _measurement_history.clear()
         
-        return confirmed_length, True, unified_duration  # Return confirmed length, success flag, and duration
+        return confirmed_length, True, unified_duration
     else:
-        # No confirmation yet, check if servo timer has expired
-        if _active_servo_pin is not None and _now() >= _servo_expiry_t:
-            park_all_servos()
-            _active_servo_pin = None
-        
-        return length_cm, False, 0.0  # Return current length and failure flag
-
-# =========================
-# Object Detection Classes
-# =========================
-class DetectorObj:
-    def __init__(self):
-        self.kernel = cv2.getStructuringElement(cv2.MORPH_RECT, MORPH_KSIZE)
-
-    def detect_objects(self, frame_small, area_min_small):
-        gray = cv2.cvtColor(frame_small, cv2.COLOR_BGR2GRAY)
-        gray_blur = cv2.GaussianBlur(gray, BLUR_KSIZE, 0)
-        mask = cv2.adaptiveThreshold(
-            gray_blur, 255,
-            cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV,
-            ADAPTIVE_BLOCK_SIZE, ADAPTIVE_C
-        )
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, self.kernel, iterations=OPEN_ITER)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self.kernel, iterations=CLOSE_ITER)
-
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        return [cnt for cnt in contours if cv2.contourArea(cnt) > area_min_small]
-
-# Initialize detectors
-detector = DetectorObj()
-parameters = cv2.aruco.DetectorParameters()
-aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_5X5_50)
-aruco_detector = cv2.aruco.ArucoDetector(aruco_dict, parameters)
-
-# =========================
-# Object Detection Processing (Webcam Only)
-# =========================
-def process_object_detection(frame):
-    """Process object detection only on webcam frames"""
-    global pixel_cm_ratio, _last_scale
-    global _stable_length_cm, _locked_until_t, _prev_center
-    global _frame_history, _active_servo_pin, _relay_b_active
-
-    img_full = frame.copy()
-
-    # Check if Relay B is active - if yes, skip object detection
-    if _relay_b_active and RELAY_B_ENABLED:
-        # Display message that detection is paused
-        cv2.putText(img_full, "OBJECT DETECTION PAUSED", 
-                    (img_full.shape[1]//2 - 200, img_full.shape[0]//2), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 255), 3)
-        cv2.putText(img_full, "Relay B is active", 
-                    (img_full.shape[1]//2 - 150, img_full.shape[0]//2 + 50), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
-        
-        # Still check servo timer and park if expired
-        if _active_servo_pin is not None and _now() >= _servo_expiry_t:
-            park_all_servos()
-            _active_servo_pin = None
-        
-        # Apply relay outputs
-        a_on, b_on, servo_on = _apply_output_levels()
-        
-        # Display minimal status
-        display_minimal_status(img_full, a_on, b_on, servo_on)
-        
-        # Add camera indicator
-        cv2.putText(img_full, "USB Webcam - Object Detection PAUSED", 
-                    (img_full.shape[1] - 450, 30), cv2.FONT_HERSHEY_SIMPLEX, 
-                    0.6, (0, 0, 255), 2)
-        
-        return img_full
-
-    # ---------- ArUco detection for scale ----------
-    corners, ids, _ = aruco_detector.detectMarkers(img_full)
-    aruco_mask = None
-    
-    if corners:
-        # Create a mask to exclude ArUco marker areas from object detection
-        aruco_mask = np.zeros(img_full.shape[:2], dtype=np.uint8)
-        int_corners = np.intp(corners)
-        
-        # Draw filled polygons on the mask where ArUco markers are detected
-        for corner in int_corners:
-            cv2.fillPoly(aruco_mask, corner, 255)
-            
-        # Also draw the outlines for visualization
-        cv2.polylines(img_full, int_corners, True, (0, 255, 0), 5)
-        
-        # Calculate pixel_cm_ratio from ArUco marker
-        pts = corners[0][0]
-        d01 = np.linalg.norm(pts[1] - pts[0])
-        d12 = np.linalg.norm(pts[2] - pts[1])
-        d23 = np.linalg.norm(pts[3] - pts[2])
-        d30 = np.linalg.norm(pts[0] - pts[3])
-        mean_side_px = (d01 + d12 + d23 + d30) / 4.0
-
-        measured_px_per_cm = mean_side_px / float(MARKER_SIZE_CM)
-        _last_scale = _ema(_last_scale, measured_px_per_cm, SCALE_EMA_ALPHA)
-        pixel_cm_ratio = _last_scale
-        
-        cv2.putText(img_full, f"ArUco: px/cm = {pixel_cm_ratio:.2f}",
-                    (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
-    else:
-        if pixel_cm_ratio:
-            cv2.putText(img_full, f"No ArUco: using px/cm = {pixel_cm_ratio:.2f}",
-                        (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 165, 255), 2)
-        else:
-            cv2.putText(img_full, "No ArUco: waiting for calibration",
-                        (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 100, 255), 2)
-
-    # ---------- ROI & downscale ----------
-    if USE_ROI:
-        x0, y0, rw, rh = ROI_RECT
-        x1, y1 = x0 + rw, y0 + rh
-        offx, offy = x0, y0
-        proc_img_full = img_full[y0:y1, x0:x1]
-        # Draw ROI rectangle
-        cv2.rectangle(img_full, (x0, y0), (x1, y1), (0, 200, 255), 2)
-        cv2.putText(img_full, "ROI Active", (x0 + 10, y0 - 10), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 255), 2)
-    else:
-        offx = offy = 0
-        proc_img_full = img_full
-
-    fx = fy = float(DOWNSCALE_FACTOR)
-    if not (0 < fx < 1):
-        fx = fy = 1.0
-    
-    proc_small = cv2.resize(proc_img_full, None, fx=fx, fy=fy, interpolation=cv2.INTER_AREA)
-    area_min_small = AREA_MIN * (fx * fy)
-
-    # ---------- Object detection with ArUco exclusion ----------
-    contours_small = detector.detect_objects(proc_small, area_min_small)
-
-    rects_full = []
-    if contours_small:
-        scale_back = 1.0 / fx
-        for cnt_s in contours_small:
-            cnt_full = (cnt_s.astype(np.float32) * scale_back) + np.array([[[offx, offy]]], dtype=np.float32)
-            rect = cv2.minAreaRect(cnt_full)
-            (cx, cy), (w, h), angle = rect
-            
-            # Check if this contour is inside an ArUco marker area
-            is_inside_aruco = False
-            if aruco_mask is not None:
-                # Convert center point to integer
-                center_int = (int(cx), int(cy))
-                # Check if the center is within the ArUco mask
-                if (0 <= center_int[0] < aruco_mask.shape[1] and 
-                    0 <= center_int[1] < aruco_mask.shape[0]):
-                    if aruco_mask[center_int[1], center_int[0]] > 0:
-                        is_inside_aruco = True
-            
-            # Only add to rects_full if NOT inside ArUco marker
-            if not is_inside_aruco:
-                rects_full.append((cx, cy, w, h, angle))
-
-    chosen = None
-    now = _now()
-
-    if rects_full:
-        if _prev_center is not None:
-            cx_prev, cy_prev = _prev_center
-            rects_sorted = sorted(
-                rects_full,
-                key=lambda r: (np.hypot(r[0] - cx_prev, r[1] - cy_prev), -max(r[2], r[3]))
-            )
-            candidate = rects_sorted[0]
-            dist = np.hypot(candidate[0] - cx_prev, candidate[1] - cy_prev)
-            if dist <= MAX_CENTER_JUMP or now < _locked_until_t:
-                chosen = candidate
-            else:
-                if now >= _locked_until_t:
-                    chosen = candidate
-                    _locked_until_t = now + (LOCK_MS / 1000.0)
-        else:
-            chosen = max(rects_full, key=lambda r: max(r[2], r[3]))
-            _locked_until_t = now + (LOCK_MS / 1000.0)
-
-    confirmed = False
-    confirmed_length = None
-    activation_duration = 0.0
-    
-    if chosen and pixel_cm_ratio:
-        cx, cy, w, h, angle = chosen
-        rect_s = ((cx, cy), (w, h), angle)
-        box = cv2.boxPoints(rect_s).astype(np.int32)
-        box = _order_box_points(box)
-
-        longer_side_px = max(w, h)
-        raw_length_cm = (float(longer_side_px) / float(pixel_cm_ratio)) * float(CALIB_K)
-
-        if _stable_length_cm is None:
-            _stable_length_cm = raw_length_cm
-        else:
-            if abs(raw_length_cm - _stable_length_cm) >= HYSTERESIS_CM:
-                _stable_length_cm = _ema(_stable_length_cm, raw_length_cm, LENGTH_EMA_ALPHA)
-
-        cv2.polylines(img_full, [box], True, (255, 0, 0), 2)
-        _draw_long_side(img_full, box, (0, 255, 255), 3)
-
-        cv2.circle(img_full, (int(cx), int(cy)), 5, (0, 0, 255), -1)
-        
-        # Check for 2-frame confirmation and control servos
-        confirmed_length, confirmed, activation_duration = control_servos_with_confirmation(_stable_length_cm)
-        
-        # Display confirmation status with duration info
-        if confirmed:
-            label_len = f"Length {round(confirmed_length, 1)} cm"
-            color = (0, 255, 0)  # Green for confirmed
-            # Add duration info
-            duration_text = f"Active for {activation_duration}s"
-            cv2.putText(img_full, duration_text, (int(cx - 100), int(cy + 45)),
-                        cv2.FONT_HERSHEY_PLAIN, 1.5, (0, 200, 255), 2)
-        else:
-            # Show confirmation progress
-            progress = min(len(_frame_history), _CONFIRMATION_FRAMES)
-            label_len = f"Length {round(_stable_length_cm, 1)} cm [{progress}/{_CONFIRMATION_FRAMES}]"
-            color = (100, 200, 0)  # Yellow for in-progress
-        
-        cv2.putText(img_full, label_len, (int(cx - 100), int(cy + 15)),
-                    cv2.FONT_HERSHEY_PLAIN, 2, color, 2)
-
-        if _prev_center is None or np.hypot(cx - _prev_center[0], cy - _prev_center[1]) > 3:
-            _prev_center = (cx, cy)
-            _locked_until_t = now + (LOCK_MS / 1000.0)
-
-    else:
-        _stable_length_cm = None
-        _prev_center = None
-        _frame_history = []  # Reset confirmation history when no object detected
         # Check if servo timer has expired
-        if _active_servo_pin is not None and _now() >= _servo_expiry_t:
-            park_all_servos()
+        now = _now()
+        if _active_servo_pin is not None and now >= _servo_expiry_t:
+            print(f"âœ“ Returning Servo {_active_servo_pin} to start position")
+            _move_servo_to_start(_active_servo_pin)  # Return to start position
             _active_servo_pin = None
-
-    # Apply relay outputs and get current states
-    a_on, b_on, servo_on = _apply_output_levels()
-    
-    # Display status information
-    display_full_status(img_full, a_on, b_on, servo_on, confirmed, pixel_cm_ratio, activation_duration)
-    
-    # Add camera indicator
-    status_text = "USB Webcam - Object Detection Active"
-    if not RELAY_B_ENABLED:
-        status_text += " (Relay B DISABLED)"
-    cv2.putText(img_full, status_text, 
-                (img_full.shape[1] - 500, 30), cv2.FONT_HERSHEY_SIMPLEX, 
-                0.6, (0, 255, 255), 2)
-    
-    cv2.putText(img_full, "Press button to switch to Pi Camera", 
-                (img_full.shape[1] - 500, 60), cv2.FONT_HERSHEY_SIMPLEX, 
-                0.6, (100, 255, 100), 2)
-
-    return img_full
-
-def display_minimal_status(img, a_on, b_on, servo_on):
-    """Display minimal status when Relay B is active"""
-    global _active_servo_pin, _servo_expiry_t  # Add these globals
-    
-    y = 60
-    
-    # Display Relay B active warning
-    cv2.putText(img, "RELAY B ACTIVE - Detection Paused", 
-                (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-    y += 40
-    
-    # Show relay states
-    cv2.putText(img, f"Relay A: {'ON' if a_on else 'OFF'}", (20, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0) if a_on else (0, 0, 255), 2)
-    y += 25
-    cv2.putText(img, f"Relay B: {'ON' if b_on else 'OFF'}", (20, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0) if b_on else (0, 0, 255), 2)
-    
-    y += 30
-    # Show servo state with remaining time
-    if _active_servo_pin is not None:
-        remaining = max(0, _servo_expiry_t - _now())
-        cv2.putText(img, f"Servo {_active_servo_pin}: ACTIVE ({remaining:.1f}s)", (20, y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-    else:
-        cv2.putText(img, "All servos: PARKED", (20, y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-
-def display_full_status(img, a_on, b_on, servo_on, confirmed, pixel_cm_ratio, activation_duration=0.0):
-    """Display full status information"""
-    global _active_servo_pin, _servo_expiry_t, _relay_b_button_expiry_t, _relay_b_detect_expiry_t  # Add these globals
-    
-    y = 60
-    
-    # Display calibration status
-    if pixel_cm_ratio:
-        calibration_status = f"Calibrated: {pixel_cm_ratio:.2f} px/cm"
-        calibration_color = (200, 255, 200)
-    else:
-        calibration_status = "NOT CALIBRATED - Show ArUco marker"
-        calibration_color = (100, 100, 255)
-    
-    cv2.putText(img, calibration_status, 
-                (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, calibration_color, 2)
-    y += 25
-    
-    # Display Relay B enabled status
-    if RELAY_B_ENABLED:
-        relay_b_status = "Relay B: ENABLED"
-        relay_b_color = (100, 255, 100)
-    else:
-        relay_b_status = "Relay B: DISABLED"
-        relay_b_color = (255, 100, 100)
-    
-    cv2.putText(img, relay_b_status, 
-                (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, relay_b_color, 2)
-    y += 25
-    
-    # Display confirmation requirements
-    cv2.putText(img, f"Confirmation: {_CONFIRMATION_FRAMES} frames", 
-                (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 100), 2)
-    y += 25
-    
-    if pixel_cm_ratio:
-        cv2.putText(img, f"CALIB_K: {CALIB_K:.3f}",
-                    (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 255, 200), 2)
-        y += 25
-    
-    cv2.putText(img, f"Relay A (BTN only): {'ON' if a_on else 'OFF'}", (20, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0) if a_on else (0, 0, 255), 2)
-    y += 25
-    
-    relay_b_text = f"Relay B (BTN+detect): {'ON' if b_on else 'OFF'}"
-    if not RELAY_B_ENABLED:
-        relay_b_text += " (DISABLED)"
-    cv2.putText(img, relay_b_text, (20, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0) if b_on else (0, 0, 255), 2)
-    y += 25
-
-    # Show activation durations table
-    y += 10
-    cv2.putText(img, "Activation Durations:", (20, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 100), 2)
-    y += 25
-    
-    for pin, duration in ACTIVATION_DURATIONS.items():
-        current_pin = (_active_servo_pin == pin)
-        if current_pin and confirmed:
-            pin_text = f"Servo {pin}: {duration}s ⚡"
-            color = (0, 255, 0)
-        elif current_pin:
-            pin_text = f"Servo {pin}: {duration}s →"
-            color = (255, 255, 0)
-        else:
-            pin_text = f"Servo {pin}: {duration}s"
-            color = (200, 200, 200)
         
-        cv2.putText(img, pin_text, (20, y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-        y += 20
+        return length_cm, False, 0.0
 
-    y += 10
-    # Show current servo state with timer
-    if _active_servo_pin is not None:
-        remaining = max(0, _servo_expiry_t - _now())
-        status_text = f"Servo {_active_servo_pin}: ACTIVE ({remaining:.1f}s remaining)"
-        cv2.putText(img, status_text, (20, y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        y += 25
-        
-        # If Relay B is also active, show that too
-        if b_on and RELAY_B_ENABLED:
-            relay_b_remaining = max(0, max(_relay_b_button_expiry_t, _relay_b_detect_expiry_t) - _now())
-            relay_text = f"Relay B: ACTIVE ({relay_b_remaining:.1f}s remaining)"
-            cv2.putText(img, relay_text, (20, y),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+def _apply_output_levels():
+    """Check and apply servo states based on timers"""
+    global _active_servo_pin, _system_busy
+    
+    now = _now()
+    
+    # Check if servo timer has expired
+    servo_on = now < _servo_expiry_t
+    
+    # Update system busy state
+    if SYSTEM_BUSY_ENABLED:
+        _system_busy = servo_on
+    
+    # If servo timer expired and there's an active servo, return it to start
+    if not servo_on and _active_servo_pin is not None:
+        _move_servo_to_start(_active_servo_pin)
+        _active_servo_pin = None
 
-def display_picam_view(frame):
-    """Display Raspberry Pi Camera view (no object detection)"""
-    img_full = frame.copy()
-    
-    # Add simple info overlay
-    h, w = img_full.shape[:2]
-    
-    # Create a semi-transparent overlay for info
-    overlay = img_full.copy()
-    cv2.rectangle(overlay, (10, 10), (500, 180), (0, 0, 0), -1)
-    img_full = cv2.addWeighted(overlay, 0.7, img_full, 0.3, 0)
-    
-    # Display camera info
-    cv2.putText(img_full, "Raspberry Pi Camera - View Only", (20, 40), 
-                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
-    
-    cv2.putText(img_full, f"Resolution: {w}x{h}", (20, 70), 
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 2)
-    
-    cv2.putText(img_full, "Press button to switch to Webcam (Object Detection)", (20, 100), 
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (100, 255, 100), 2)
-    
-    # Show Relay B status
-    if RELAY_B_ENABLED:
-        relay_status = "Relay B: ENABLED in Webcam mode"
-        relay_color = (100, 255, 100)
-    else:
-        relay_status = "Relay B: DISABLED in Webcam mode"
-        relay_color = (255, 100, 100)
-    
-    cv2.putText(img_full, relay_status, (20, 130), 
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, relay_color, 2)
-    
-    # Show unified activation durations
-    y = 160
-    cv2.putText(img_full, "Unified Activation Durations:", (20, y), 
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 100), 2)
-    y += 25
-    
-    for pin, duration in ACTIVATION_DURATIONS.items():
-        cv2.putText(img_full, f"Servo {pin}: {duration}s (Relay B same)", (30, y), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
-        y += 20
-    
-    return img_full
+    return servo_on
 
 # =========================
-# Main Function
+# MEASUREMENT CALCULATION FROM YOLO DETECTION
 # =========================
-def main():
-    global webcam, picam2
+def calculate_measurement_from_yolo(box_data):
+    """Calculate physical length from YOLO bounding box"""
+    global pixel_cm_ratio, _stable_length_cm
     
-    print("=" * 60)
-    print("Camera Switcher with Object Detection")
-    print("=" * 60)
-    print(f"Relay B: {'ENABLED' if RELAY_B_ENABLED else 'DISABLED'}")
-    print(f"ROI: {'ENABLED' if USE_ROI else 'DISABLED'}")
-    if USE_ROI:
-        print(f"ROI Rect: {ROI_RECT}")
-    print("\nUNIFIED ACTIVATION DURATIONS (Servo & Relay B):")
-    for pin, duration in ACTIVATION_DURATIONS.items():
-        print(f"  Servo {pin}: {duration}s")
-    print("\nButton Durations:")
-    print(f"  Relay A (button): {BUTTON_ON_DURATION_18}s")
-    print(f"  Relay B (button): {BUTTON_ON_DURATION_22}s")
-    print("-" * 60)
-    print("Starting with USB Webcam (Object Detection Active)")
-    print("Press button on GPIO 17 to switch cameras")
-    print("Press ESC to exit")
-    print("=" * 60)
+    if box_data is None or len(box_data) < 4:
+        return None
     
-    # Setup servos
-    setup_servos()
+    # Extract bounding box coordinates
+    x1, y1, x2, y2 = box_data
     
-    # Initialize with webcam first
-    if not init_webcam():
-        print("Failed to initialize USB webcam!")
-        print("Trying Raspberry Pi Camera instead...")
-        if not init_picam():
-            print("No cameras available!")
-            return
+    # Calculate width and height in pixels
+    w_px = abs(x2 - x1)
+    h_px = abs(y2 - y1)
     
-    try:
-        while True:
-            # Check for camera switch button
-            poll_camera_switch_button()
-            
-            # Get frame from current camera
-            frame = get_frame()
-            
-            if frame is not None:
-                if _current_camera == "webcam":
-                    # Process object detection on webcam
-                    poll_object_detection_button()
-                    processed_frame = process_object_detection(frame)
-                else:
-                    # Just display Pi Camera view
-                    processed_frame = display_picam_view(frame)
+    # Use the longer side for measurement
+    longer_side_px = max(w_px, h_px)
+    
+    # Convert pixels to centimeters
+    raw_length_cm = (float(longer_side_px) / float(pixel_cm_ratio)) * float(CALIB_K)
+    
+    # Apply EMA smoothing for stability
+    if _stable_length_cm is None:
+        _stable_length_cm = raw_length_cm
+    else:
+        _stable_length_cm = _ema(_stable_length_cm, raw_length_cm, LENGTH_EMA_ALPHA)
+    
+    return _stable_length_cm
+
+# =========================
+# DETECTION AND DISPLAY FUNCTIONS
+# =========================
+def process_detections(results, frame, confidence_threshold=0.5):
+    """Process YOLO detections based on current camera mode"""
+    global _stable_length_cm, _measurement_history, _last_detection_time
+    global _relay_active, _relay_expiry_t
+    
+    annotated_frame = frame.copy()
+    current_measurement = None
+    confirmed_detection = False
+    confirmed_length = None
+    detected_class = None
+    
+    now = _now()
+    
+    # Reset measurement history if switching modes or no detection
+    if now - _last_detection_time > _no_detection_threshold:
+        _measurement_history.clear()
+        if camera_mode != 0:  # Don't reset stable length for Pi Camera mode
+            _stable_length_cm = None
+    
+    if hasattr(results[0], 'boxes') and results[0].boxes is not None:
+        # Get bounding boxes, classes, and confidences
+        boxes = results[0].boxes.xyxy.cpu().numpy()
+        classes = results[0].boxes.cls.cpu().numpy()
+        confidences = results[0].boxes.conf.cpu().numpy()
+        
+        # Get class names from model
+        class_names = results[0].names
+        
+        # Process each detection
+        for i, (box, cls_idx, conf) in enumerate(zip(boxes, classes, confidences)):
+            if conf < confidence_threshold:
+                continue
                 
-                # Resize and display
-                processed_frame = cv2.resize(processed_frame, (1024, 768))
-                cv2.imshow("Camera View - Press ESC to exit", processed_frame)
+            class_name = class_names[int(cls_idx)]
+            detected_class = class_name.lower()
             
-            # Check for ESC key
-            key = cv2.waitKey(1)
-            if key == 27:  # ESC key
-                break
+            # Extract box coordinates
+            x1, y1, x2, y2 = box.astype(int)
+            
+            # Calculate center of bounding box
+            center_x = (x1 + x2) // 2
+            center_y = (y1 + y2) // 2
+            
+            # Different processing based on camera mode
+            if camera_mode == 0:  # WEBCAM MODE - Samaral detection with measurement
+                if detected_class == "samaral":
+                    # Calculate measurement only for samaral in webcam mode
+                    current_measurement = calculate_measurement_from_yolo(box)
+                    
+                    if current_measurement is not None:
+                        # Check for confirmation and control servos
+                        confirmed_length, confirmed, activation_duration = control_servos_with_confirmation(
+                            current_measurement, detected_class
+                        )
+                        confirmed_detection = confirmed
+                        
+                        # Display measurement info
+                        display_measurement_info(
+                            annotated_frame, 
+                            center_x, center_y, 
+                            current_measurement, 
+                            confirmed, 
+                            confirmed_length if confirmed else None
+                        )
+                    
+                    # Update last detection time
+                    _last_detection_time = now
+                    
+            else:  # PI CAMERA MODE - Complete/Incomplete detection with relay control
+                if detected_class in ["complete", "incomplete"]:
+                    # ACTIVATE RELAYS IMMEDIATELY WHEN "COMPLETE" IS DETECTED
+                    if detected_class == "complete" and not _relay_active:
+                        print(f"âœ“ 'Complete' detected! Activating relays for {RELAY_ACTIVATION_DURATION}s")
+                        activate_relays()
+                    
+                    # Display Pi Camera info
+                    display_pi_camera_info(
+                        annotated_frame,
+                        center_x, center_y,
+                        detected_class,
+                        conf,
+                        _relay_active
+                    )
+                    
+                    # Update last detection time
+                    _last_detection_time = now
+            
+            # Draw bounding box with different colors based on mode and class
+            if camera_mode == 0:  # Webcam mode
+                if detected_class == "samaral":
+                    box_color = (0, 255, 0) if confirmed_detection else (0, 165, 255)  # Green if confirmed, orange if measuring
+                else:
+                    box_color = (255, 255, 0)  # Yellow for other classes in webcam mode
+            else:  # Pi Camera mode
+                if detected_class == "complete":
+                    box_color = (0, 255, 0)  # Green for complete
+                elif detected_class == "incomplete":
+                    box_color = (0, 0, 255)  # Red for incomplete
+                else:
+                    box_color = (255, 255, 255)  # White for other classes
+            
+            # Draw bounding box
+            cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), box_color, 2)
+            
+            # Draw label
+            label = f"{class_name} {conf:.2f}"
+            if camera_mode == 0 and detected_class == "samaral" and current_measurement is not None:
+                label += f" ({current_measurement:.1f}cm)"
+            
+            label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0]
+            cv2.rectangle(annotated_frame, (x1, y1 - label_size[1] - 5), 
+                          (x1 + label_size[0], y1), box_color, -1)
+            cv2.putText(annotated_frame, label, (x1, y1 - 5), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+            
+            # Add confirmation indicator for samaral in webcam mode
+            if camera_mode == 0 and detected_class == "samaral" and confirmed_detection:
+                cv2.circle(annotated_frame, (center_x, center_y), 15, (0, 255, 0), 3)
+                cv2.putText(annotated_frame, "CONFIRMED!", 
+                           (center_x - 60, center_y - 80),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
     
-    finally:
-        # Cleanup
-        print("\nCleaning up...")
-        
-        stop_servos()
-        
-        if webcam is not None:
-            webcam.release()
-            print("USB Webcam released")
-        
-        if picam2 is not None:
-            picam2.stop()
-            print("Raspberry Pi Camera stopped")
-        
-        GPIO.cleanup()
-        cv2.destroyAllWindows()
-        print("Program exited")
+    return annotated_frame, current_measurement, confirmed_detection, confirmed_length, detected_class
 
-if __name__ == "__main__":
-    main()
+def display_measurement_info(frame, x, y, stable_length_cm, confirmed=False, confirmed_length=None):
+    """Display measurement information on the frame (webcam mode only)"""
+    
+    # Choose position for text (above bounding box)
+    text_x = int(x - 200 if x > 250 else x + 10)
+    text_y = int(y - 40 if y > 50 else y + 40)
+    
+    if confirmed and confirmed_length is not None:
+        text = f"CONFIRMED: {confirmed_length:.1f}cm"
+        color = (0, 255, 0)  # Green
+        thickness = 3
+    else:
+        # Show measurement progress
+        if _measurement_history:
+            time_span = _now() - _measurement_history[0][1] if _measurement_history else 0
+            progress = min(100, (time_span / _CONFIRMATION_WINDOW_SEC) * 100)
+            text = f"Measuring: {stable_length_cm:.1f}cm [{progress:.0f}%]"
+            color = (100, 200, 0)  # Light green
+        else:
+            text = f"Measuring: {stable_length_cm:.1f}cm"
+            color = (100, 100, 255)  # Light blue
+        thickness = 2
+    
+    # Draw text with background for better visibility
+    text_size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, thickness)[0]
+    cv2.rectangle(frame, (text_x - 5, text_y - text_size[1] - 5), 
+                  (text_x + text_size[0] + 5, text_y + 5), (0, 0, 0), -1)
+    
+    cv2.putText(frame, text, (text_x, text_y),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, thickness)
+
+def display_pi_camera_info(frame, x, y, detected_class, confidence, relay_active=False):
+    """Display information for Pi Camera mode (complete/incomplete)"""
+    
+    text_x = int(x - 100 if x > 150 else x + 10)
+    text_y = int(y - 40 if y > 50 else y + 40)
+    
+    if detected_class == "complete":
+        text = f"âœ“ COMPLETE"
+        color = (0, 255, 0)  # Green
+    else:  # incomplete
+        text = f"âœ— INCOMPLETE"
+        color = (0, 0, 255)  # Red
+    
+    text += f" {confidence:.2f}"
+    
+    # Add relay status if active
+    if relay_active and detected_class == "complete":
+        text += " [RELAYS ON]"
+        color = (0, 255, 255)  # Cyan when relays are active
+    
+    # Draw text with background
+    text_size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+    cv2.rectangle(frame, (text_x - 5, text_y - text_size[1] - 5), 
+                  (text_x + text_size[0] + 5, text_y + 5), (0, 0, 0), -1)
+    
+    cv2.putText(frame, text, (text_x, text_y),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+
+def display_servo_status(img, servo_on):
+    """Display servo status on the video feed"""
+    global _active_servo_pin, _servo_expiry_t, _relay_active
+    
+    y = 180  # Starting Y position for status
+    
+    if camera_mode == 0:  # Webcam mode - show servo status
+        if _active_servo_pin is not None and servo_on:
+            remaining = max(0, _servo_expiry_t - _now())
+            servo_text = f"SERVO {_active_servo_pin}: ACTIVE ({remaining:.1f}s)"
+            cv2.putText(img, servo_text, (20, y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        elif _active_servo_pin is not None:
+            cv2.putText(img, f"SERVO {_active_servo_pin}: RETURNING", (20, y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 165, 0), 2)
+        else:
+            cv2.putText(img, "SERVOS: READY", (20, y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+    else:  # Pi Camera mode - show relay status
+        if _relay_active:
+            remaining = max(0, _relay_expiry_t - _now())
+            relay_text = f"RELAYS 23&24: ACTIVE ({remaining:.1f}s)"
+            cv2.putText(img, relay_text, (20, y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        else:
+            cv2.putText(img, "RELAYS: READY", (20, y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 165, 0), 2)
+    
+    return y
+
+# =========================
+# CAMERA INITIALIZATION
+# =========================
+def init_webcam():
+    """Initialize webcam (USB camera)"""
+    webcam = cv2.VideoCapture(0)
+    webcam.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+    webcam.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    return webcam
+
+def init_picam():
+    """Initialize Pi Camera"""
+    picam2 = Picamera2()
+    picam2.preview_configuration.main.size = (1280, 720)
+    picam2.preview_configuration.main.format = "RGB888"
+    picam2.preview_configuration.align()
+    picam2.configure("preview")
+    picam2.start()
+    return picam2
+
+# =========================
+# MAIN PROGRAM
+# =========================
+
+# Setup servos first
+print("Initializing GPIO, servos, and relays...")
+setup_servos()
+print(f"Relays initialized on pins {RELAY_1_PIN} and {RELAY_2_PIN}")
+print(f"Relay activation duration: {RELAY_ACTIVATION_DURATION} seconds")
+
+# Initialize cameras
+print("\nInitializing cameras...")
+webcam = init_webcam()
+picam2 = init_picam()
+print("Cameras initialized successfully!")
+
+# Load YOLOv8 model
+model = YOLO("/home/jelo/inheat/samaral.pt")
+
+# Check webcam initialization
+if not webcam.isOpened():
+    print("Warning: Could not open webcam!")
+    webcam = None
+
+# Display class names from model
+print("\n=== MODEL CLASSES ===")
+for idx, name in model.names.items():
+    print(f"  Class {idx}: {name}")
+print("=====================")
+
+# System configuration
+print("\n=== SYSTEM CONFIGURATION ===")
+print(f"Webcam Mode: Samaral detection with measurement & servo control")
+print(f"Pi Camera Mode: Complete/Incomplete detection with relay control")
+print(f"Relay activation: {RELAY_ACTIVATION_DURATION}s for 'complete' detection")
+print(f"Complete confirmation: {_COMPLETE_CONFIRMATION_FRAMES} consecutive frames")
+print(f"Pixel-to-cm ratio: {pixel_cm_ratio}")
+print(f"Confirmation window: {_CONFIRMATION_WINDOW_SEC} seconds")
+print(f"Length tolerance: {_LENGTH_TOLERANCE_CM} cm")
+print("\n=== SERVO CONFIGURATION ===")
+print(f"Servo pins: {SERVO_PINS}")
+for pin in SERVO_PINS:
+    print(f"  Servo {pin}: {SERVO_POSITIONS[pin]['start']}Â° â†’ {SERVO_POSITIONS[pin]['end']}Â° for {ACTIVATION_DURATIONS[pin]}s")
+print("\n=== ACTIVATION RANGES ===")
+print("8.7-10.0cm: Servo 5")
+print("10.0-11.5cm: Servo 6") 
+print("11.5-14.3cm: Servo 12")
+print("Other: Servo 13")
+print("==========================\n")
+
+print("\nCamera Control System Started")
+print("==============================")
+print("Current mode: Webcam (Samaral detection + measurement)")
+print("Press button on GPIO 17 to switch to Pi Camera (Complete/Incomplete + relays)")
+print("Press 'q' to quit")
+print("Press '+' to increase confidence threshold")
+print("Press '-' to decrease confidence threshold")
+print("Press 'c' to calibrate pixel ratio")
+print("Press 's' to show/hide servo ranges")
+print("Press 'r' to reset measurement")
+print("Press 'd' to change relay duration")
+print("\n")
+
+# Variables for main loop
+confidence_threshold = 0.5
+show_servo_ranges = True
+button_pressed = False
+
+try:
+    while True:
+        # Check button state
+        button_state = GPIO.input(BUTTON_PIN)
+        
+        # Detect button press based on active high/low configuration
+        if USE_ACTIVE_HIGH:
+            # Active HIGH logic: button pressed when HIGH
+            if button_state == GPIO.HIGH and not button_pressed:
+                button_pressed = True
+                camera_mode = 1 - camera_mode  # Toggle between 0 and 1
+                
+                # Clear measurement history when switching modes
+                _measurement_history.clear()
+                _stable_length_cm = None
+                _last_detection_time = _now()
+                reset_complete_detection()
+                
+                # Deactivate relays if switching away from Pi Camera mode
+                if camera_mode == 0 and _relay_active:
+                    deactivate_relays()
+                
+                if camera_mode == 0:
+                    print("\n" + "="*50)
+                    print("SWITCHED TO: WEBCAM MODE")
+                    print("- Samaral detection with measurement")
+                    print("- Servo activation based on length")
+                    print("="*50 + "\n")
+                else:
+                    print("\n" + "="*50)
+                    print("SWITCHED TO: PI CAMERA MODE")
+                    print("- Complete/Incomplete detection")
+                    print("- Relays activate on 'complete' detection")
+                    print(f"- Relay duration: {RELAY_ACTIVATION_DURATION}s")
+                    print("="*50 + "\n")
+                
+                time.sleep(0.3)  # Debounce delay
+                
+            # Reset button state when released (active HIGH)
+            elif button_state == GPIO.LOW and button_pressed:
+                button_pressed = False
+                
+        else:
+            # Active LOW logic: button pressed when LOW (default)
+            if button_state == GPIO.LOW and not button_pressed:
+                button_pressed = True
+                camera_mode = 1 - camera_mode  # Toggle between 0 and 1
+                
+                # Clear measurement history when switching modes
+                _measurement_history.clear()
+                _stable_length_cm = None
+                _last_detection_time = _now()
+                reset_complete_detection()
+                
+                # Deactivate relays if switching away from Pi Camera mode
+                if camera_mode == 0 and _relay_active:
+                    deactivate_relays()
+                
+                if camera_mode == 0:
+                    print("\n" + "="*50)
+                    print("SWITCHED TO: WEBCAM MODE")
+                    print("- Samaral detection with measurement")
+                    print("- Servo activation based on length")
+                    print("="*50 + "\n")
+                else:
+                    print("\n" + "="*50)
+                    print("SWITCHED TO: PI CAMERA MODE")
+                    print("- Complete/Incomplete detection")
+                    print("- Relays activate on 'complete' detection")
+                    print(f"- Relay duration: {RELAY_ACTIVATION_DURATION}s")
+                    print("="*50 + "\n")
+                
+                time.sleep(0.3)  # Debounce delay
+                
+            # Reset button state when released (active LOW)
+            elif button_state == GPIO.HIGH and button_pressed:
+                button_pressed = False
+        
+        # Capture frame based on current mode
+        if camera_mode == 0:  # Webcam mode
+            if webcam is not None:
+                ret, frame = webcam.read()
+                if not ret:
+                    print("Error: Could not read from webcam!")
+                    # Create a blank frame with error message
+                    height, width = 720, 1280
+                    frame = np.zeros((height, width, 3), dtype=np.uint8)
+                    cv2.putText(frame, "Webcam Error", (50, 50), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+                    cv2.imshow("Dual Camera System", frame)
+                    if cv2.waitKey(1) == ord("q"):
+                        break
+                    continue
+            else:
+                # Create a blank frame with error message
+                height, width = 720, 1280
+                frame = np.zeros((height, width, 3), dtype=np.uint8)
+                cv2.putText(frame, "Webcam Not Available", (50, 50), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+                cv2.imshow("Dual Camera System", frame)
+                if cv2.waitKey(1) == ord("q"):
+                    break
+                continue
+        else:  # Pi Camera mode
+            frame = picam2.capture_array()
+            # Convert from RGB to BGR for OpenCV compatibility
+            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        
+        # Run YOLO model with confidence threshold
+        results = model(frame, conf=confidence_threshold)
+        
+        # Check servo states (only matters in webcam mode)
+        servo_on = _apply_output_levels()
+        
+        # Check relay timer (only matters in Pi Camera mode)
+        check_relay_timer()
+        
+        # Process detections based on current mode
+        annotated_frame, current_measurement, confirmed_detection, confirmed_length, detected_class = process_detections(
+            results, frame, confidence_threshold
+        )
+        
+        # Get inference time and calculate FPS
+        inference_time = results[0].speed['inference']
+        fps = 1000 / inference_time if inference_time > 0 else 0
+        
+        # Prepare status text
+        mode_name = "Webcam (Samaral)" if camera_mode == 0 else "PiCam (Complete/Incomplete)"
+        status_text = f"FPS: {fps:.1f} | Mode: {mode_name} | Conf: {confidence_threshold:.2f}"
+        if camera_mode == 0 and current_measurement is not None:
+            status_text += f" | Length: {current_measurement:.1f}cm"
+            if confirmed_detection:
+                status_text += f" âœ“"
+        elif camera_mode == 1 and _relay_active:
+            remaining = max(0, _relay_expiry_t - _now())
+            status_text += f" | Relays ON ({remaining:.1f}s)"  # <<< RELAY DURATION DISPLAY HERE
+        
+        # Display status
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        text_size = cv2.getTextSize(status_text, font, 0.6, 1)[0]
+        text_x = annotated_frame.shape[1] - text_size[0] - 10
+        text_y = text_size[1] + 10
+        
+        # Draw status background
+        cv2.rectangle(annotated_frame, (text_x - 5, text_y - text_size[1] - 5), 
+                      (annotated_frame.shape[1] - 5, text_y + 5), (0, 0, 0), -1)
+        
+        # Draw status text
+        cv2.putText(annotated_frame, status_text, (text_x, text_y), 
+                    font, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
+        
+        # Draw camera mode indicator
+        if camera_mode == 0:
+            mode_text = "WEBCAM: Samaral Detection & Servo Control"
+            mode_color = (0, 255, 0)
+        else:
+            mode_text = f"PI CAMERA: Complete/Incomplete Detection & Relays ({RELAY_ACTIVATION_DURATION}s)"
+            mode_color = (255, 165, 0)
+        
+        cv2.putText(annotated_frame, mode_text, (10, 30), 
+                    font, 0.8, mode_color, 2, cv2.LINE_AA)
+        
+        # Display servo/relay status
+        status_y = display_servo_status(annotated_frame, servo_on)
+        
+        # Display relay duration info for Pi Camera mode
+        if camera_mode == 1:
+            y = status_y + 40
+            if _relay_active:
+                remaining = max(0, _relay_expiry_t - _now())
+                cv2.putText(annotated_frame, f"Relays active: {remaining:.1f}s remaining", 
+                           (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                y += 30
+            else:
+                cv2.putText(annotated_frame, f"Relays ready - will run {RELAY_ACTIVATION_DURATION}s on 'complete'", 
+                           (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 200, 100), 2)
+                y += 30
+        
+        # Display measurement progress for webcam mode
+        elif camera_mode == 0 and _measurement_history:
+            y = status_y + 40
+            progress = min(100, ((_now() - _measurement_history[0][1]) / _CONFIRMATION_WINDOW_SEC) * 100)
+            cv2.putText(annotated_frame, f"Measurement Stability: {len(_measurement_history)} samples", 
+                       (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 0), 1)
+            cv2.putText(annotated_frame, f"Progress: {progress:.0f}%", 
+                       (20, y + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 0), 1)
+            
+            # Display servo ranges if enabled
+            if show_servo_ranges:
+                y += 50
+                cv2.putText(annotated_frame, "Servo Activation Ranges:", (20, y),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 200, 100), 2)
+                y += 25
+                
+                ranges_text = [
+                    "8.7-10.0cm: Servo 5",
+                    "10.0-11.5cm: Servo 6", 
+                    "11.5-14.3cm: Servo 12",
+                    "Other: Servo 13"
+                ]
+                
+                for text in ranges_text:
+                    cv2.putText(annotated_frame, text, (30, y),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+                    y += 20
+        
+        # Draw instructions
+        instructions = "GPIO17/S: Switch | +/-: Conf | c: Calib | s: Ranges | r: Reset | d: Relay Dur | q: Quit"
+        cv2.putText(annotated_frame, instructions, (10, annotated_frame.shape[0] - 10), 
+                    font, 0.5, (200, 200, 200), 1, cv2.LINE_AA)
+        
+        # Display the frame
+        cv2.imshow("Dual Camera System", annotated_frame)
+        
+        # Handle keyboard input
+        key = cv2.waitKey(1) & 0xFF
+        
+        if key == ord('q'):
+            break
+        elif key == ord('s') or key == ord('S'):  # <<< ADDED KEYBOARD SWITCHING HERE
+            # Keyboard switch cameras
+            camera_mode = 1 - camera_mode  # Toggle between 0 and 1
+            
+            # Clear measurement history when switching modes
+            _measurement_history.clear()
+            _stable_length_cm = None
+            _last_detection_time = _now()
+            reset_complete_detection()
+            
+            # Deactivate relays if switching away from Pi Camera mode
+            if camera_mode == 0 and _relay_active:
+                deactivate_relays()
+            
+            if camera_mode == 0:
+                print("\n" + "="*50)
+                print("KEYBOARD SWITCHED TO: WEBCAM MODE")
+                print("- Samaral detection with measurement")
+                print("- Servo activation based on length")
+                print("="*50 + "\n")
+            else:
+                print("\n" + "="*50)
+                print("KEYBOARD SWITCHED TO: PI CAMERA MODE")
+                print("- Complete/Incomplete detection")
+                print("- Relays activate on 'complete' detection")
+                print(f"- Relay duration: {RELAY_ACTIVATION_DURATION}s")
+                print("="*50 + "\n")
+        elif key == ord('+'):
+            confidence_threshold = min(0.95, confidence_threshold + 0.05)
+            print(f"Confidence threshold increased to: {confidence_threshold:.2f}")
+        elif key == ord('-'):
+            confidence_threshold = max(0.05, confidence_threshold - 0.05)
+            print(f"Confidence threshold decreased to: {confidence_threshold:.2f}")
+        elif key == ord('c'):
+            # Calibration mode - only for webcam mode
+            if camera_mode == 0:
+                print("\n=== CALIBRATION MODE ===")
+                print(f"Current pixel-to-cm ratio: {pixel_cm_ratio}")
+                try:
+                    new_ratio = float(input("Enter new pixel-to-cm ratio (or press Enter to keep current): "))
+                    if new_ratio > 0:
+                        pixel_cm_ratio = new_ratio
+                        print(f"Pixel-to-cm ratio updated to: {pixel_cm_ratio}")
+                except:
+                    print("Keeping current value")
+                print("=========================\n")
+            else:
+                print("Calibration only available in Webcam mode")
+        elif key == ord('s'):
+            show_servo_ranges = not show_servo_ranges
+            print(f"Servo ranges display: {'ON' if show_servo_ranges else 'OFF'}")
+        elif key == ord('r'):
+            if camera_mode == 0:
+                _measurement_history.clear()
+                _stable_length_cm = None
+                print("Measurement reset")
+            else:
+                reset_complete_detection()
+                print("Complete detection reset")
+        elif key == ord('d'):
+            if camera_mode == 1:
+                print("\n=== RELAY DURATION SETTING ===")
+                print(f"Current relay duration: {RELAY_ACTIVATION_DURATION} seconds")
+                try:
+                    new_duration = float(input("Enter new relay duration in seconds: "))
+                    if new_duration > 0:
+                        RELAY_ACTIVATION_DURATION = new_duration
+                        print(f"Relay duration updated to: {RELAY_ACTIVATION_DURATION} seconds")
+                except:
+                    print("Keeping current duration")
+                print("==============================\n")
+            else:
+                print("Relay duration setting only available in Pi Camera mode")
+
+except KeyboardInterrupt:
+    print("\nProgram interrupted by user")
+
+except Exception as e:
+    print(f"\nError occurred: {e}")
+    import traceback
+    traceback.print_exc()
+
+finally:
+    # Cleanup
+    print("\nCleaning up resources...")
+    
+    # Return all servos to start position
+    if _active_servo_pin is not None:
+        print(f"Returning servo {_active_servo_pin} to start position...")
+        _move_servo_to_start(_active_servo_pin)
+    
+    # Deactivate relays
+    deactivate_relays()
+    
+    # Stop all servos
+    stop_servos()
+    
+    # Release cameras
+    if webcam is not None:
+        webcam.release()
+    picam2.stop()
+    
+    # Close windows
+    cv2.destroyAllWindows()
+    
+    # Cleanup GPIO
+    GPIO.cleanup()
+    
+    print("Resources cleaned up successfully!")
+    print("Goodbye!")
+
+
