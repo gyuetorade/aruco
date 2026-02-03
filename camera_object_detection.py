@@ -22,6 +22,8 @@ RELAY_B_ACTIVE_LOW = False
 # =========================
 # Enable/Disable Relay B
 RELAY_B_ENABLED = False  # Set to False to disable Relay B completely
+# Enable/Disable System Busy blocking
+SYSTEM_BUSY_ENABLED = True  # Set to False to allow measurements while servo/relay is active
 
 # Durations (in seconds)
 BUTTON_ON_DURATION_18 = 1.0  # Relay A duration when button pressed
@@ -62,6 +64,7 @@ ROI_RECT = (100, 100, 1050, 520)  # (x, y, width, height)
 # 2-Frame Confirmation
 _CONFIRMATION_FRAMES = 2
 _LENGTH_TOLERANCE_CM = 0.3
+_CONFIRMATION_DURATION_SEC = 0.5  # Minimum time span for confirmation
 
 # ArUco Parameters
 MARKER_SIZE_CM = 5.00
@@ -449,11 +452,11 @@ def park_all_servos():
 # 2-Frame Confirmation System - WITH BUSY CHECK
 # =========================
 def _check_length_confirmation(current_length_cm):
-    """Check if we have 2 consecutive frames with the same length"""
+    """Check if we have 2 consecutive frames with the same length over minimum duration"""
     global _frame_history
     
-    # If system is busy (servo or relay active), don't process new confirmations
-    if _system_busy:
+    # If system is busy (servo or relay active), don't process new confirmations (if enabled)
+    if SYSTEM_BUSY_ENABLED and _system_busy:
         return None
     
     now = _now()
@@ -478,8 +481,11 @@ def _check_length_confirmation(current_length_cm):
         min_length = min(lengths)
         max_length = max(lengths)
         
-        # If all lengths are within tolerance, confirmation achieved
-        if (max_length - min_length) <= _LENGTH_TOLERANCE_CM:
+        # Check time span between first and last frame
+        time_span = recent_frames[-1][1] - recent_frames[0][1]
+        
+        # If all lengths are within tolerance AND time span is at least 0.5 seconds, confirmation achieved
+        if (max_length - min_length) <= _LENGTH_TOLERANCE_CM and time_span >= _CONFIRMATION_DURATION_SEC:
             # Return the average length
             return np.mean(lengths)
     
@@ -489,8 +495,8 @@ def control_servos_with_confirmation(length_cm):
     """Control servos only after 2-frame confirmation"""
     global _active_servo_pin, _frame_history, _system_busy
     
-    # If system is already busy (servo or relay active), don't start new actions
-    if _system_busy:
+    # If system is already busy (servo or relay active), don't start new actions (if enabled)
+    if SYSTEM_BUSY_ENABLED and _system_busy:
         return length_cm, False, 0.0
     
     # Check for 2-frame confirmation
@@ -580,8 +586,8 @@ def process_object_detection(frame):
     # Store busy state globally
     _system_busy = system_busy
     
-    # If system is busy, skip ALL object detection processing
-    if system_busy:
+    # If system is busy AND system busy blocking is enabled, skip ALL object detection processing
+    if SYSTEM_BUSY_ENABLED and system_busy:
         # Display system busy message
         cv2.putText(img_full, "SYSTEM BUSY - Waiting for timer...", 
                     (img_full.shape[1]//2 - 250, img_full.shape[0]//2), 
@@ -756,9 +762,12 @@ def process_object_detection(frame):
             cv2.putText(img_full, duration_text, (int(cx - 100), int(cy + 45)),
                         cv2.FONT_HERSHEY_PLAIN, 1.5, (0, 200, 255), 2)
         else:
-            # Show confirmation progress
+            # Show confirmation progress (frames and time)
             progress = min(len(_frame_history), _CONFIRMATION_FRAMES)
-            label_len = f"Length {round(_stable_length_cm, 1)} cm [{progress}/{_CONFIRMATION_FRAMES}]"
+            time_elapsed = 0.0
+            if len(_frame_history) >= 2:
+                time_elapsed = _frame_history[-1][1] - _frame_history[0][1]
+            label_len = f"Length {round(_stable_length_cm, 1)} cm [{progress}/{_CONFIRMATION_FRAMES}, {time_elapsed:.1f}s/{_CONFIRMATION_DURATION_SEC}s]"
             color = (100, 200, 0)  # Yellow for in-progress
         
         cv2.putText(img_full, label_len, (int(cx - 100), int(cy + 15)),
@@ -874,7 +883,7 @@ def display_full_status(img, a_on, b_on, servo_on, confirmed, pixel_cm_ratio, ac
     y += 25
     
     # Display confirmation requirements
-    cv2.putText(img, f"Confirmation: {_CONFIRMATION_FRAMES} frames", 
+    cv2.putText(img, f"Confirmation: {_CONFIRMATION_FRAMES} frames + {_CONFIRMATION_DURATION_SEC}s", 
                 (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 100), 2)
     y += 25
     
